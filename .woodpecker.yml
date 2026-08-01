@@ -1,0 +1,37 @@
+# Woodpecker CI pipeline for metrika-alert
+# Docs: https://woodpecker-ci.org/docs/
+
+# Test suite — runs on every push and PR.
+- name: test
+  image: golang:1.24-bookworm
+  commands:
+    - go mod tidy -v
+    - go build -v ./...
+    - go vet ./...
+    - go test -race -timeout 5m ./...
+
+# Build static binary — produces metrika-alert for the target platform.
+- name: build
+  image: golang:1.24-bookworm
+  depends_on: [test]
+  commands:
+    - CGO_ENABLED=0 GOOS=${GOOS:-linux} GOARCH=${GOARCH:-amd64} go build -ldflags="-s -w" -o dist/metrika-alert ./cmd/server
+  when:
+    event: push
+    branch: main
+  platforms:
+    - linux/amd64
+
+# Build and push Docker image to ghcr.io.
+- name: docker
+  image: plugins/docker
+  settings:
+    registry: ghcr.io
+    repo: ghcr.io/isklv/metrika-alert
+    tags: ["${CI_COMMIT_SHA}", "latest"]
+    username: ${GHCR_USERNAME}
+    password: ${GHCR_TOKEN}
+  depends_on: [test]
+  when:
+    event: push
+    branch: main
