@@ -1,0 +1,24 @@
+# Database: relative path resolved under ~/.metrika-alert/, or absolute path.
+database: metrika.db
+
+# Telegram bot (from @BotFather). Required for alert delivery.
+telegram:
+  bot_token: ""
+  # User IDs allowed to use the bot (comma-separated list in yaml).
+  admin_ids:
+    - 123456789
+  # Optional SOCKS5/HTTP proxy for Telegram API calls.
+  # proxy_url: socks5://user:pass@proxy.example.com:1080
+
+# Yandex.Metrika API endpoints (usually no need to change).
+metrika:
+  base_url: https://api-metrika.yandex.ru
+  logs_url: https://logs.metrika.yandex.ru
+
+# REST API (optional, for external integrations).
+api:
+  enabled: false
+  listen_addr: ":8090"
+
+# Periodic report interval in hours. Set to 0 to disable.
+report_interval_hours: 1
