@@ -1,0 +1,12 @@
+# Binaries
+metrika-alert
+dist/
+build/
+
+# Go build cache
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
