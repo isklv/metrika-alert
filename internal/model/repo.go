@@ -213,9 +213,13 @@ func (db *DB) DeleteTrigger(ctx context.Context, id int64) error {
 // ---- AlertActions ----
 
 func (db *DB) CreateAlertAction(ctx context.Context, a *AlertAction) error {
+	var chatID sql.NullInt64
+	if a.ChatID != nil {
+		chatID = sql.NullInt64{Int64: *a.ChatID, Valid: true}
+	}
 	res, err := db.ExecContext(ctx,
 		`INSERT INTO alert_actions (name, type, chat_id, url) VALUES (?, ?, ?, ?)`,
-		a.Name, a.Type, sql.NullInt64{Int64: *a.ChatID, Valid: a.ChatID != nil}, &a.URL,
+		a.Name, a.Type, chatID, &a.URL,
 	)
 	if err != nil {
 		return fmt.Errorf("create alert action: %w", err)
@@ -336,9 +340,13 @@ func (db *DB) CreateReportSnapshot(ctx context.Context, s *ReportSnapshot) error
 	if err != nil {
 		return fmt.Errorf("marshal goals: %w", err)
 	}
+	var monitorID sql.NullInt64
+	if s.MonitorID != nil {
+		monitorID = sql.NullInt64{Int64: *s.MonitorID, Valid: true}
+	}
 	res, err := db.ExecContext(ctx,
 		`INSERT INTO report_snapshots (counter_id, monitor_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.CounterID, sql.NullInt64{Int64: *s.MonitorID, Valid: s.MonitorID != nil}, s.Period, s.PeriodKey, s.TakenAt, s.Visits, s.UniqueVisits, s.Bounces, s.AvgDuration, s.Depth, string(goalsJSON), s.Revenue, s.Orders,
+		s.CounterID, monitorID, s.Period, s.PeriodKey, s.TakenAt, s.Visits, s.UniqueVisits, s.Bounces, s.AvgDuration, s.Depth, string(goalsJSON), s.Revenue, s.Orders,
 	)
 	if err != nil {
 		return fmt.Errorf("create report snapshot: %w", err)

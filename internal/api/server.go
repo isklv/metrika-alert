@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -354,13 +356,19 @@ func parseOptionalInt64(s string) int64 {
 }
 
 func parseBodyInt64(r *http.Request, key string) int64 {
+	// Read and buffer the body so the caller can re-decode it afterwards.
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return 0
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var body map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return 0
 	}
 	var v int64
-	if raw, ok := body[key]; ok {
-		json.Unmarshal(raw, &v)
+	if rawv, ok := body[key]; ok {
+		json.Unmarshal(rawv, &v)
 	}
 	return v
 }

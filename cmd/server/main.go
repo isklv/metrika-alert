@@ -83,6 +83,7 @@ func main() {
 		}
 		b := bot.NewBot(tgBot, db, cfg.Telegram.AdminIDs)
 		botActions = bot.NewBotActions(b)
+		b.SetActions(botActions)
 
 		u := tgbotapi.NewUpdate(0)
 		u.Timeout = 60

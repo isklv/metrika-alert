@@ -69,13 +69,14 @@ func (ba *BotActions) recordPending(userID int64, chatID int64, kind string, arg
 
 // recordPendingAction delegates to the BotActions instance.
 func (b *Bot) recordPendingAction(userID int64, chatID int64, kind string, args ...string) {
-	// This is called from handlers; the real recording happens via BotActions.
-	// We store it on the action struct instead.
+	if b.actions != nil {
+		b.actions.recordPending(userID, chatID, kind, args...)
+	}
 }
 
-// SetRecordPending replaces the no-op with the real recorder.
+// SetRecordPending is retained for API compatibility; pending actions are
+// recorded through the BotActions instance wired via SetActions.
 func (b *Bot) SetRecordPending(fn func(userID int64, chatID int64, kind string, args ...string)) {
-	// Handled by BotActions directly now.
 }
 
 func (ba *BotActions) handleAddCounter(p *pendingAction, text string) bool {
@@ -117,15 +118,17 @@ func (ba *BotActions) handleAddCounter(p *pendingAction, text string) bool {
 
 func (ba *BotActions) handleAddMonitor(p *pendingAction, text string) bool {
 	if p.step == 0 {
+		// The counter id comes from the /addmonitor argument; record it up
+		// front so both the inline and step-by-step paths persist it.
+		p.data["counter_id"] = p.args[0]
 		// First message after prompt: parse inline or ask step by step.
 		parts := strings.Fields(text)
 		if len(parts) >= 2 {
-			// Try single-message format: name url_pattern [metrics]
-			p.data["counter_id"] = p.args[0]
+			// Single-message format: name url_pattern [metrics]
 			p.data["name"] = parts[0]
 			p.data["url_pattern"] = parts[1]
 			if len(parts) >= 3 {
-				p.data["metrics"] = strings.Join(parts[2:], " ")
+				p.data["metrics"] = strings.Join(parts[2:], ",")
 			} else {
 				p.data["metrics"] = "visits,bounces,goals,revenue"
 			}
@@ -190,16 +193,23 @@ func (ba *BotActions) saveMonitor(p *pendingAction) bool {
 
 func (ba *BotActions) handleAddTrigger(p *pendingAction, text string) bool {
 	parts := strings.Fields(text)
-	if len(parts) < 4 {
-		ba.bot.reply(p.chatID, "Неверный формат.\n`имя condition порог окно_мин кулдаун_мин [monitor_id]`\n\nПример: `Ошибки status_code == 500 3 15 60`")
+	// Format: `имя field op value порог окно_мин кулдаун_мин [monitor_id]`
+	// The condition is exactly three tokens (field, op, value); the trailing
+	// numbers sit at fixed positions, so a numeric condition value (e.g.
+	// "status_code == 500") is never mistaken for the trailing fields.
+	// Minimum 7 tokens (no monitor), 8 tokens (with monitor).
+	if len(parts) < 7 || len(parts) > 8 {
+		ba.bot.reply(p.chatID, "Неверный формат.\n`имя field op value порог окно_мин кулдаун_мин [monitor_id]`\n\nПример: `Ошибки status_code == 500 3 15 60`")
 		return true
 	}
 
 	counterID, _ := strconv.ParseInt(p.args[0], 10, 64)
 	name := parts[0]
-	threshold, _ := strconv.Atoi(parts[2])
-	window, _ := strconv.Atoi(parts[3])
-	cooldown, _ := strconv.Atoi(parts[4])
+	condition := strings.Join(parts[1:4], " ")
+
+	threshold, _ := strconv.Atoi(parts[4])
+	window, _ := strconv.Atoi(parts[5])
+	cooldown, _ := strconv.Atoi(parts[6])
 	if threshold <= 0 {
 		threshold = 1
 	}
@@ -211,18 +221,11 @@ func (ba *BotActions) handleAddTrigger(p *pendingAction, text string) bool {
 	}
 
 	var monitorID *int64
-	if len(parts) >= 6 {
-		if mid, err := strconv.ParseInt(parts[5], 10, 64); err == nil && mid > 0 {
+	if len(parts) == 8 {
+		if mid, err := strconv.ParseInt(parts[7], 10, 64); err == nil && mid > 0 {
 			monitorID = &mid
 		}
 	}
-
-	// Rejoin parts[1..n-3] as condition (may contain spaces like "page_url contains /checkout").
-	condEnd := len(parts) - 3
-	if len(parts) >= 6 {
-		condEnd = len(parts) - 4
-	}
-	condition := strings.Join(parts[1:condEnd], " ")
 
 	trigger := &model.Trigger{
 		CounterID:    counterID,

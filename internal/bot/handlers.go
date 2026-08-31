@@ -15,6 +15,7 @@ type Bot struct {
 	api  *tgbotapi.BotAPI
 	db   *model.DB
 	adminIDs map[int64]bool
+	actions *BotActions
 }
 
 func NewBot(api *tgbotapi.BotAPI, db *model.DB, adminIDs []int64) *Bot {
@@ -23,6 +24,12 @@ func NewBot(api *tgbotapi.BotAPI, db *model.DB, adminIDs []int64) *Bot {
 		admins[id] = true
 	}
 	return &Bot{api: api, db: db, adminIDs: admins}
+}
+
+// SetActions wires the BotActions instance so command handlers can record
+// pending multi-step flows. Called once at startup after NewBotActions.
+func (b *Bot) SetActions(actions *BotActions) {
+	b.actions = actions
 }
 
 // IsAdmin returns true if the user ID is in the admin list.
