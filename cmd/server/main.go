@@ -39,7 +39,7 @@ func main() {
 	}
 	defer db.Close()
 
-	router, err := alert.NewRouter(cfg.Telegram.BotToken, db)
+	router, err := newAlertRouter(cfg.Telegram.BotToken, db)
 	if err != nil {
 		log.Fatalf("alert router: %v", err)
 	}
@@ -77,7 +77,7 @@ func main() {
 			log.Printf("telegram using proxy: %s", cfg.Telegram.ProxyURL)
 		}
 
-		tgBot, err := tgbotapi.NewBotAPIWithClient(cfg.Telegram.BotToken, "", tgClient)
+		tgBot, err := newBotAPI(cfg.Telegram.BotToken, tgClient)
 		if err != nil {
 			log.Fatalf("telegram bot: %v", err)
 		}
@@ -109,7 +109,25 @@ func main() {
 	time.Sleep(2 * time.Second)
 }
 
-func runReportsLoop(ctx context.Context, reporter *engine.Reporter, interval time.Duration) {
+// newBotAPI creates the Telegram bot API client. A package-level variable so
+// tests can inject a fake endpoint instead of hitting api.telegram.org.
+var newBotAPI = func(token string, client *http.Client) (*tgbotapi.BotAPI, error) {
+	return tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, client)
+}
+
+// newAlertRouter creates the alert delivery router. A package-level variable
+// so tests can avoid the real getMe call made by alert.NewRouter for a
+// non-empty token.
+var newAlertRouter = func(token string, db *model.DB) (*alert.Router, error) {
+	return alert.NewRouter(token, db)
+}
+
+// reportRunner is the part of *engine.Reporter used by runReportsLoop.
+type reportRunner interface {
+	RunReports(ctx context.Context) error
+}
+
+func runReportsLoop(ctx context.Context, reporter reportRunner, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
