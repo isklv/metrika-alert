@@ -61,13 +61,20 @@ func main() {
 	// --- Chat clients -------------------------------------------------------
 	// Built before the router so that alert delivery and command handling share
 	// one connection per platform, including its proxy settings.
+	//
+	// A channel that will not connect is disabled rather than fatal. The two
+	// platforms fail independently — Telegram is commonly unreachable from
+	// Russian networks without a proxy — and letting one take the process down
+	// would silence the other along with it.
 	tgBot, err := newTelegramBot(cfg)
 	if err != nil {
-		log.Fatalf("telegram: %v", err)
+		log.Printf("WARNING: telegram disabled — %v", err)
+		tgBot = nil
 	}
 	vkClient, err := newVKTeamsClient(cfg)
 	if err != nil {
-		log.Fatalf("vkteams: %v", err)
+		log.Printf("WARNING: vkteams disabled — %v", err)
+		vkClient = nil
 	}
 
 	routerOpts := alert.Options{TelegramAdmins: cfg.Telegram.AdminIDs, VKTeamsAdmins: cfg.VKTeams.AdminIDs}
@@ -81,7 +88,7 @@ func main() {
 	log.Printf("alert channels: %s", strings.Join(router.Channels(), ", "))
 
 	if tgBot == nil && vkClient == nil {
-		log.Printf("WARNING: no chat bot configured — alerts will only reach webhook destinations")
+		log.Printf("WARNING: ни один чат-канал не поднялся — алерты дойдут только до webhook-адресатов")
 	}
 
 	// --- Engine -------------------------------------------------------------
@@ -177,19 +184,18 @@ func newTelegramBot(cfg *config.Config) (*tgbotapi.BotAPI, error) {
 		return nil, nil
 	}
 
+	transport, err := proxyTransport("telegram", cfg.Telegram.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
 	client := http.DefaultClient
-	if cfg.Telegram.ProxyURL != "" {
-		proxy, err := url.Parse(cfg.Telegram.ProxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse proxy_url: %w", err)
-		}
-		client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxy)}}
-		log.Printf("telegram using proxy: %s", proxy.Redacted())
+	if transport != nil {
+		client = &http.Client{Transport: transport}
 	}
 
 	api, err := tgbotapi.NewBotAPIWithClient(cfg.Telegram.BotToken, tgbotapi.APIEndpoint, client)
 	if err != nil {
-		return nil, fmt.Errorf("connect bot API: %w", err)
+		return nil, fmt.Errorf("не удалось подключиться к api.telegram.org: %w%s", err, telegramHint(cfg))
 	}
 	log.Printf("telegram bot ready: @%s", api.Self.UserName)
 	return api, nil
@@ -201,9 +207,13 @@ func newVKTeamsClient(cfg *config.Config) (*vkteams.Client, error) {
 		return nil, nil
 	}
 
+	transport, err := proxyTransport("vkteams", cfg.VKTeams.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
 	client, err := vkteams.New(cfg.VKTeams.BotToken, vkteams.Options{
-		BaseURL:  cfg.VKTeams.BaseURL,
-		ProxyURL: cfg.VKTeams.ProxyURL,
+		BaseURL:   cfg.VKTeams.BaseURL,
+		Transport: transport,
 	})
 	if err != nil {
 		return nil, err
@@ -215,10 +225,61 @@ func newVKTeamsClient(cfg *config.Config) (*vkteams.Client, error) {
 	defer cancel()
 	self, err := client.GetSelf(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("verify token against %s: %w", client.BaseURL(), err)
+		return nil, fmt.Errorf("не удалось проверить токен на %s: %w", client.BaseURL(), err)
 	}
 	log.Printf("vkteams bot ready: %s (%s) at %s", self.Nick, self.UserID, client.BaseURL())
 	return client, nil
+}
+
+// proxySchemes are what net/http's Transport can actually route through.
+// socks5h is a common and silent mistake: curl accepts it, Go does not.
+var proxySchemes = map[string]bool{"http": true, "https": true, "socks5": true}
+
+// proxyTransport builds the transport a chat client should use, or nil for a
+// direct connection.
+//
+// The scheme is checked rather than trusted. url.Parse accepts
+// "proxy.example:1080" by reading the host as the scheme, which would leave the
+// client connecting directly while the config plainly names a proxy — the exact
+// failure this reports instead.
+func proxyTransport(platform, proxyURL string) (http.RoundTripper, error) {
+	if proxyURL == "" {
+		log.Printf("%s: прямое подключение, прокси не задан", platform)
+		return nil, nil
+	}
+
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("proxy_url %q не разобрался: %w", proxyURL, err)
+	}
+	if !proxySchemes[parsed.Scheme] || parsed.Host == "" {
+		return nil, fmt.Errorf(
+			"proxy_url %q: нужна схема http://, https:// или socks5:// и хост (socks5h Go не поддерживает)",
+			proxyURL)
+	}
+
+	log.Printf("%s: через прокси %s", platform, parsed.Redacted())
+	return &http.Transport{Proxy: http.ProxyURL(parsed)}, nil
+}
+
+// telegramHint points at the usual cause. api.telegram.org resolves into
+// 149.154.160.0/20, so a timeout on an address in that range is a blocked or
+// unrouted path to Telegram — not a problem with the token or with VK Teams.
+func telegramHint(cfg *config.Config) string {
+	if cfg.Telegram.ProxyURL == "" {
+		return " (сеть до Telegram недоступна? задайте telegram.proxy_url)"
+	}
+	// Never echo the raw value: a proxy URL routinely carries a password.
+	return " (через прокси " + redactProxy(cfg.Telegram.ProxyURL) + " — проверьте, что он жив)"
+}
+
+// redactProxy strips credentials from a proxy URL for display.
+func redactProxy(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "(указанный прокси)"
+	}
+	return parsed.Redacted()
 }
 
 func warnIfNoAdmins(platform string, count int) {

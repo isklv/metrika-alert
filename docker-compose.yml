@@ -10,15 +10,21 @@ services:
       # --- Telegram ---
       METRIKA_BOT_TOKEN: "${METRIKA_BOT_TOKEN:-}"
       METRIKA_ADMIN_IDS: "${METRIKA_ADMIN_IDS:-}"
+      # api.telegram.org is unreachable from many networks. Without this the
+      # container connects directly and the dial to 149.154.160.0/20 times out.
+      METRIKA_PROXY_URL: "${METRIKA_PROXY_URL:-}"
       # --- VK Teams ---
       METRIKA_VKTEAMS_TOKEN: "${METRIKA_VKTEAMS_TOKEN:-}"
       METRIKA_VKTEAMS_ADMINS: "${METRIKA_VKTEAMS_ADMINS:-}"
       # On-premise VK Teams: point this at your own host.
       METRIKA_VKTEAMS_BASE: "${METRIKA_VKTEAMS_BASE:-https://myteam.mail.ru/bot/v1}"
+      METRIKA_VKTEAMS_PROXY: "${METRIKA_VKTEAMS_PROXY:-}"
       # --- REST API (off by default) ---
       METRIKA_API_ENABLED: "${METRIKA_API_ENABLED:-false}"
       METRIKA_API_TOKEN: "${METRIKA_API_TOKEN:-}"
       METRIKA_REPORT_HOURS: "${METRIKA_REPORT_HOURS:-1}"
+      METRIKA_METRIKA_BASE: "${METRIKA_METRIKA_BASE:-}"
+      METRIKA_STEP_MINUTES: "${METRIKA_STEP_MINUTES:-}"
       TZ: "${TZ:-Europe/Moscow}"
 
     volumes:
@@ -27,7 +33,7 @@ services:
     # Published only on loopback: the API creates counters and reads alert
     # history. Expose it more widely only behind a reverse proxy with TLS.
     ports:
-      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:18090:8090"
 
     healthcheck:
       # Only meaningful with METRIKA_API_ENABLED=true; otherwise nothing listens.
