@@ -194,6 +194,24 @@ sudo journalctl -u metrika-alert -f
 
 Полный список команд — `/help`.
 
+### Если Telegram недоступен
+
+`api.telegram.org` во многих сетях не резолвится или блокируется. Задайте
+`METRIKA_PROXY_URL` (схемы `http`, `https`, `socks5` — `socks5h` Go не
+поддерживает). В Docker Compose переменная **обязательно** должна быть в секции
+`environment:`, иначе `.env` до контейнера не доедет.
+
+Проверить, что прокси применился, можно по строке в логе старта:
+
+```
+telegram: через прокси socks5://user:xxxxx@proxy.example.com:1080
+```
+
+Если там `telegram: прямое подключение, прокси не задан` — значение не дошло.
+
+Канал, который не поднялся, отключается с предупреждением, а сервис продолжает
+работать на остальных: недоступный Telegram не должен заглушать ВК Тимс.
+
 ### Куда идут алерты
 
 Пока ни один destination не создан, алерты уходят администраторам из
@@ -346,6 +364,10 @@ sudo -u metrika sqlite3 /var/lib/metrika-alert/metrika.db \
 | `poller started: no counters configured` | счётчиков нет — добавьте через `/addcounter` |
 | Счётчик добавлен, но опроса нет | перезапустите сервис: цикл опроса строится при старте |
 | `x509: certificate signed by unknown authority` | в образе нет CA-сертификатов. Пересоберите образ текущим Dockerfile |
+| `dial tcp 149.154.166.110:443: i/o timeout` | это **Telegram** (диапазон `149.154.160.0/20`), а не ВК Тимс. Прямой dial в Telegram означает, что прокси не применился: при рабочем прокси в ошибке стоял бы его адрес и префикс `proxyconnect`. Проверьте строку `telegram: через прокси …` в логе старта |
+| В логе `telegram: прямое подключение, прокси не задан`, хотя `METRIKA_PROXY_URL` задан | переменная не доехала до процесса. В Docker Compose она должна быть перечислена в `environment:` — одного `.env` мало |
+| `proxy_url …: нужна схема http://, https:// или socks5://` | значение без схемы (`proxy:1080`) или `socks5h://`. Go поддерживает только `http`, `https`, `socks5` |
+| `WARNING: telegram disabled` | канал отключён, сервис работает дальше на остальных. Недоступность одного канала не роняет процесс |
 | `database is locked` | база на сетевом томе (NFS/SMB). Перенесите на локальный диск |
 | `metrika API 403: Access denied` | OAuth-токен счётчика не даёт доступа. Нужно право `metrika:read`, а для разбивки по целям — доступ к управлению счётчиком |
 | Алертов нет совсем | нужна история: правилу требуется минимум две прошлые точки того же часа и дня недели, то есть около двух недель наблюдений |
@@ -379,7 +401,7 @@ journalctl -u metrika-alert -f           # systemd
 | `METRIKA_DB_DIR` | — | `/var/lib/metrika-alert` (только для относительных путей) |
 | `METRIKA_BOT_TOKEN` | `telegram.bot_token` | `7304642400:AAH…` |
 | `METRIKA_ADMIN_IDS` | `telegram.admin_ids` | `123456789,987654321` |
-| `METRIKA_PROXY_URL` | `telegram.proxy_url` | `socks5://proxy:1080` |
+| `METRIKA_PROXY_URL` | `telegram.proxy_url` | `socks5://proxy:1080` (схемы: `http`, `https`, `socks5`) |
 | `METRIKA_VKTEAMS_TOKEN` | `vkteams.bot_token` | `001.0123…:700000001` |
 | `METRIKA_VKTEAMS_BASE` | `vkteams.base_url` | `https://myteam.corp.example/bot/v1` |
 | `METRIKA_VKTEAMS_ADMINS` | `vkteams.admin_ids` | `admin@corp.example,ops@corp.example` |

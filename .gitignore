@@ -11,8 +11,9 @@ build/
 .vscode/
 *.swp
 
-# Local runtime config and database
+# Local runtime config, database and secrets
 config.yaml
+.env
 *.db
 *.db-wal
 *.db-shm

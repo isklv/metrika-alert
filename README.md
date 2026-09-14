@@ -116,7 +116,7 @@ systemd, настройка ботов, резервное копировани�
 | `database` | путь к SQLite (относительный — от `~/.metrika-alert/`) | `metrika.db` |
 | `telegram.bot_token` | токен от @BotFather | пусто (канал выключен) |
 | `telegram.admin_ids` | ID пользователей, которым разрешено управление | `[]` |
-| `telegram.proxy_url` | SOCKS5/HTTP-прокси для Telegram API | нет |
+| `telegram.proxy_url` | прокси для Telegram API (`http`, `https`, `socks5`) | нет |
 | `vkteams.bot_token` | токен от @Metabot | пусто (канал выключен) |
 | `vkteams.base_url` | эндпоинт Bot API | `https://myteam.mail.ru/bot/v1` |
 | `vkteams.admin_ids` | ID пользователей ВК Тимс | `[]` |
