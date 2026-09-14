@@ -29,6 +29,7 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /report [counter_id] — запустить отчёт сейчас
 /poll — опросить все счётчики один раз
 /whoami — показать свой ID
+/version — версия запущенной сборки
 /help — это меню`)
 }
 
@@ -71,6 +72,16 @@ func (b *Bot) deleteCounter(ctx context.Context, chatID, args string) {
 	b.reply(ctx, chatID, fmt.Sprintf("✅ Счётчик *%s* удалён вместе с его правилами и историей", c.Name))
 }
 
+// showVersion reports the running build. A deployment that silently kept an old
+// image looks exactly like a feature that was never added; this tells them apart.
+func (b *Bot) showVersion(ctx context.Context, chatID string) {
+	v := b.version
+	if v == "" {
+		v = "неизвестна"
+	}
+	b.reply(ctx, chatID, "*Сборка:* `"+v+"`\n\nЕсли команды из документации нет в /help — запущен старый бинарь.")
+}
+
 // ---- Goals ----
 
 // listGoals answers the question a rule cannot: which goal IDs exist. Writing
@@ -94,9 +105,15 @@ func (b *Bot) listGoals(ctx context.Context, chatID, args string) {
 
 	goals, err := b.metrika.Goals(ctx, counter)
 	if err != nil {
-		b.reply(ctx, chatID, "❌ Не удалось получить цели: "+err.Error()+
-			"\n\nЧаще всего это значит, что OAuth-токен счётчика не даёт доступа к его настройкам. "+
-			"Алерты по `goals` и по конкретной цели всё равно работают — ID цели можно взять в интерфейсе Метрики.")
+		// Only say "check your token" when the API actually refused on
+		// credentials; for anything else that advice sends people to fix
+		// something that was never wrong.
+		hint := "\n\nАлерты по `goals` и по конкретной цели работают независимо — " +
+			"ID цели можно взять в интерфейсе Метрики."
+		if engine.IsAccessDenied(err) {
+			hint = "\n\nOAuth-токен счётчика не даёт доступа к его настройкам." + hint
+		}
+		b.reply(ctx, chatID, "❌ Не удалось получить цели: "+err.Error()+hint)
 		return
 	}
 	if len(goals) == 0 {
@@ -108,7 +125,7 @@ func (b *Bot) listGoals(ctx context.Context, chatID, args string) {
 	fmt.Fprintf(&sb, "*Цели — %s:*\n\n", counter.Name)
 	for _, g := range goals {
 		mark := ""
-		if g.IsFavorite {
+		if g.Favorite() {
 			mark = "⭐ "
 		}
 		if !g.Active() {

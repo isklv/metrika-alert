@@ -441,7 +441,10 @@ func TestListGoalsShowsIDsAndUsage(t *testing.T) {
 // must not read as "the feature is broken".
 func TestListGoalsExplainsAccessFailure(t *testing.T) {
 	b, tr, _ := newTestBot(t, admin)
-	b.metrika = &fakeMetrika{err: fmt.Errorf("metrika API 403: Access denied")}
+	// The real client returns a wrapped *APIError, which is what the reply
+	// classifies on — a bare string would not be recognised as a refusal.
+	b.metrika = &fakeMetrika{err: fmt.Errorf("list goals: %w",
+		&engine.APIError{StatusCode: 403, Message: "Access denied"})}
 	say(t, b, "/addcounter")
 	say(t, b, "Магазин 12345678 y0_token")
 
@@ -451,8 +454,8 @@ func TestListGoalsExplainsAccessFailure(t *testing.T) {
 	if !strings.Contains(got, "OAuth-токен") {
 		t.Errorf("the reply does not point at the likely cause:\n%s", got)
 	}
-	// Goal alerts still work without management access; say so.
-	if !strings.Contains(got, "всё равно работают") {
+	// Goal alerts do not need management access; say so.
+	if !strings.Contains(got, "работают независимо") {
 		t.Errorf("the reply does not say alerts still work:\n%s", got)
 	}
 }
@@ -482,4 +485,96 @@ func TestListGoalsNeedsAKnownCounter(t *testing.T) {
 	if got := tr.last(); !strings.Contains(got, "ID") {
 		t.Errorf("got %q", got)
 	}
+}
+
+// The question that needed guessing twice: which build is actually running.
+func TestVersionCommand(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.SetVersion("43759de от 14.09.2026 21:42")
+
+	say(t, b, "/version")
+
+	got := tr.last()
+	if !strings.Contains(got, "43759de") {
+		t.Errorf("reply does not name the build:\n%s", got)
+	}
+	// The reply should point at the usual cause of a missing command.
+	if !strings.Contains(got, "старый бинарь") {
+		t.Errorf("reply does not explain a stale deployment:\n%s", got)
+	}
+}
+
+func TestVersionCommandWithoutStamp(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+
+	say(t, b, "/version")
+
+	if got := tr.last(); !strings.Contains(got, "неизвестна") {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Every command the menu advertises must actually be dispatched — the menu is
+// how people discover them, and a gap here is exactly what looks like a bug.
+func TestMenuCommandsAreAllDispatched(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{}
+
+	say(t, b, "/help")
+	menu := tr.last()
+
+	checked := 0
+	for _, line := range strings.Split(menu, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "/") {
+			continue
+		}
+		command := strings.TrimPrefix(strings.Fields(line)[0], "/")
+
+		say(t, b, "/"+command+" 1")
+		if got := tr.last(); strings.Contains(got, "Неизвестная команда") {
+			t.Errorf("/%s is offered in the menu but not dispatched", command)
+		}
+		checked++
+	}
+
+	// Guard against the test passing because it parsed nothing.
+	if checked < 10 {
+		t.Fatalf("only %d menu commands were checked; the menu was not parsed", checked)
+	}
+	if !strings.Contains(menu, "/goals") {
+		t.Error("/goals is missing from the menu")
+	}
+}
+
+// Blaming the OAuth token for a decode failure sends people to fix something
+// that was never wrong — the message has to match the actual cause.
+func TestGoalsErrorBlamesTheTokenOnlyWhenRefused(t *testing.T) {
+	t.Run("access denied names the token", func(t *testing.T) {
+		b, tr, _ := newTestBot(t, admin)
+		b.metrika = &fakeMetrika{err: &engine.APIError{StatusCode: 403, Message: "Access denied"}}
+		say(t, b, "/addcounter")
+		say(t, b, "Магазин 12345678 y0_token")
+
+		say(t, b, "/goals 1")
+		if got := tr.last(); !strings.Contains(got, "OAuth-токен") {
+			t.Errorf("a refused request should name the token:\n%s", got)
+		}
+	})
+
+	t.Run("other failures do not", func(t *testing.T) {
+		b, tr, _ := newTestBot(t, admin)
+		b.metrika = &fakeMetrika{err: fmt.Errorf("decode response: json: cannot unmarshal number into bool")}
+		say(t, b, "/addcounter")
+		say(t, b, "Магазин 12345678 y0_token")
+
+		say(t, b, "/goals 1")
+		got := tr.last()
+		if strings.Contains(got, "OAuth-токен") {
+			t.Errorf("a decode failure was blamed on the token:\n%s", got)
+		}
+		if !strings.Contains(got, "cannot unmarshal") {
+			t.Errorf("the real error was not reported:\n%s", got)
+		}
+	})
 }

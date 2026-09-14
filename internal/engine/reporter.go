@@ -132,7 +132,7 @@ func (r *Reporter) ReportCounter(ctx context.Context, counter *model.Counter, cl
 	}
 
 	title := fmt.Sprintf("📊 Отчёт: %s — %s", counter.Name, now.Format("02.01 15:04"))
-	card := r.buildCard(today, past, goals, current.Sampled)
+	card := r.buildCard(today, past, goals, bool(current.Sampled))
 
 	return r.router.Alert(ctx, counter.ID, title, card)
 }

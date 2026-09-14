@@ -217,3 +217,75 @@ func TestGoalsDecodesFullObject(t *testing.T) {
 		t.Error("an Active goal read as inactive")
 	}
 }
+
+// The exact payload the live API returned, which the documented schema does not
+// describe: is_favorite arrives as a number.
+func TestGoalsDecodesNumericIsFavorite(t *testing.T) {
+	c := reportStub(t, `{"goals":[
+		{"id":205814783,"name":"Оформление заказа","type":"action","status":"Active","is_favorite":1},
+		{"id":205814784,"name":"Просмотр корзины","type":"url","status":"Active","is_favorite":0}]}`, nil)
+
+	goals, err := c.Goals(context.Background())
+	if err != nil {
+		t.Fatalf("Goals: %v", err)
+	}
+	if len(goals) != 2 {
+		t.Fatalf("got %d goals", len(goals))
+	}
+	if !goals[0].Favorite() {
+		t.Error("is_favorite: 1 did not read as favourite")
+	}
+	if goals[1].Favorite() {
+		t.Error("is_favorite: 0 did not read as not favourite")
+	}
+	if goals[0].ID != 205814783 || goals[0].Name != "Оформление заказа" {
+		t.Errorf("goal = %+v", goals[0])
+	}
+}
+
+// A goal object carrying fields this service does not model must still decode.
+func TestGoalsIgnoresUnmodelledFields(t *testing.T) {
+	c := reportStub(t, `{"goals":[{"id":42,"name":"Покупка","type":"action","status":"Active",
+		"is_favorite":0,"default_price":100.5,"goal_source":"user","flag":"basket","conditions":[
+		{"type":"contain","url":"/checkout"}]}]}`, nil)
+
+	goals, err := c.Goals(context.Background())
+	if err != nil {
+		t.Fatalf("Goals: %v", err)
+	}
+	if len(goals) != 1 || goals[0].ID != 42 {
+		t.Errorf("goals = %+v", goals)
+	}
+}
+
+// A sampling flag sent as a number must not fail a report — alerting runs on it.
+func TestReportDecodesNumericSampledFlag(t *testing.T) {
+	c := reportStub(t, `{"data":[],"totals":[100],"sampled":1}`, nil)
+
+	res, err := c.Fetch(context.Background(), Query{Metrics: []string{MetricVisits}})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !res.Sampled {
+		t.Error("sampled: 1 did not read as sampled")
+	}
+}
+
+func TestAccessDeniedClassification(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		if !IsAccessDenied(&APIError{StatusCode: status}) {
+			t.Errorf("HTTP %d should count as an access failure", status)
+		}
+	}
+	// A decode failure or a server fault is not a permissions problem, and
+	// saying so sends people to fix a token that was never wrong.
+	for _, err := range []error{
+		&APIError{StatusCode: 400},
+		&APIError{StatusCode: 500},
+		fmt.Errorf("decode response: unexpected type"),
+	} {
+		if IsAccessDenied(err) {
+			t.Errorf("%v should not count as an access failure", err)
+		}
+	}
+}

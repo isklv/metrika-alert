@@ -7,7 +7,14 @@ FROM golang:1.25-bookworm AS builder
 WORKDIR /src
 # The module vendors its dependencies, so the build needs no network.
 COPY . .
-RUN CGO_ENABLED=0 go build -mod=vendor -ldflags="-s -w" -o /metrika-alert ./cmd/server
+
+# The build context excludes .git, so Go cannot stamp the revision itself.
+# Passing it in is what lets a running container say which build it is —
+# without that, a stale image is indistinguishable from a missing feature.
+ARG VERSION=docker
+RUN CGO_ENABLED=0 go build -mod=vendor \
+	-ldflags="-s -w -X main.version=${VERSION}" \
+	-o /metrika-alert ./cmd/server
 
 FROM debian:bookworm-slim
 

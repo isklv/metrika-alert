@@ -37,6 +37,8 @@ func main() {
 		os.Exit(runHealthCheck())
 	}
 
+	log.Printf("metrika-alert %s", buildVersion())
+
 	cfgPath := findConfig()
 	if cfgPath == "" {
 		log.Fatalf("no config found: create %s (copy config.example.yaml)",
@@ -128,6 +130,7 @@ func main() {
 		warnIfNoAdmins("telegram", len(admins))
 
 		b := bot.New(bot.NewTelegramTransport(tgBot), db, tasks, lookup, admins)
+		b.SetVersion(buildVersion())
 		wg.Go(func() { bot.RunTelegram(ctx, tgBot, b) })
 	}
 
@@ -135,6 +138,7 @@ func main() {
 		warnIfNoAdmins("vkteams", len(cfg.VKTeams.AdminIDs))
 
 		b := bot.New(bot.NewVKTeamsTransport(vkClient), db, tasks, lookup, cfg.VKTeams.AdminIDs)
+		b.SetVersion(buildVersion())
 		wg.Go(func() { bot.RunVKTeams(ctx, vkClient, b) })
 	}
 
@@ -327,6 +331,8 @@ func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
 // With the API disabled there is nothing to probe, and the fact that this
 // binary started at all is the only signal available — so it reports healthy.
 func runHealthCheck() int {
+	log.Printf("metrika-alert %s", buildVersion())
+
 	cfgPath := findConfig()
 	if cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "health: no config found")
