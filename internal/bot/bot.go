@@ -116,12 +116,6 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		b.promptAddCounter(ctx, msg)
 	case "deletecounter":
 		b.deleteCounter(ctx, msg.ChatID, args)
-	case "monitors":
-		b.listMonitors(ctx, msg.ChatID, args)
-	case "addmonitor":
-		b.promptAddMonitor(ctx, msg, args)
-	case "deletemonitor":
-		b.deleteMonitor(ctx, msg.ChatID, args)
 	case "triggers":
 		b.listTriggers(ctx, msg.ChatID, args)
 	case "addtrigger":

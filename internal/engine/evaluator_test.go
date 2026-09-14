@@ -2,991 +2,431 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"os"
-	"strconv"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
-type alertRouter struct {
-	alerts []*alertRecord
+// byTimeFake serves /stat/v1/data/bytime from a generated hourly history.
+type byTimeFake struct {
+	mu sync.Mutex
+	// value returns the figure for one metric at one hour.
+	value    func(metric string, at time.Time) float64
+	requests []url.Values
+	sampled  bool
 }
 
-type alertRecord struct {
-	counterID int64
-	title     string
-	message   string
-}
-
-func (r *alertRouter) Alert(ctx context.Context, counterID int64, title, message string) error {
-	r.alerts = append(r.alerts, &alertRecord{counterID: counterID, title: title, message: message})
-	return nil
-}
-
-func newTestEvaluator(t *testing.T) (*Evaluator, *model.DB, *alertRouter) {
+func (f *byTimeFake) serve(t *testing.T) string {
 	t.Helper()
-	f, err := os.CreateTemp("", "metrika-test-*.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		q := r.URL.Query()
+		f.requests = append(f.requests, q)
 
-	db, err := model.OpenDB(f.Name())
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+		if strings.HasSuffix(r.URL.Path, "/goals") {
+			fmt.Fprint(w, `{"goals":[]}`)
+			return
+		}
 
-	router := &alertRouter{}
-	eval := NewEvaluator(db, router)
-	return eval, db, router
-}
+		date1, _ := time.ParseInLocation("2006-01-02", q.Get("date1"), time.Local)
+		date2, _ := time.ParseInLocation("2006-01-02", q.Get("date2"), time.Local)
+		// The API reports whole days, so the range ends at the last hour of date2.
+		end := date2.Add(23 * time.Hour)
 
-func TestMatchCondition(t *testing.T) {
-	tests := []struct {
-		name string
-		ev   *model.MetrikaEvent
-		cond string
-		want bool
-	}{
-		{"status equals", &model.MetrikaEvent{Status: "500"}, "status_code == 500", true},
-		{"status not equal", &model.MetrikaEvent{Status: "200"}, "status_code == 500", false},
-		{"not-equal op", &model.MetrikaEvent{Status: "404"}, "status_code != 200", true},
-		{"url contains", &model.MetrikaEvent{PageURL: "/checkout/step1"}, "page_url contains /checkout", true},
-		{"url not contains", &model.MetrikaEvent{PageURL: "/home"}, "page_url contains /checkout", false},
-		{"revenue greater", &model.MetrikaEvent{Revenue: 1500.5}, "revenue > 1000", true},
-		{"revenue less", &model.MetrikaEvent{Revenue: 500}, "revenue > 1000", false},
-		{"goals contains", &model.MetrikaEvent{GoalsID: []string{"42", "99"}}, "goals_id contains 42", true},
-		{"empty condition matches", &model.MetrikaEvent{PageURL: "/any"}, "", true},
-		{"custom param", &model.MetrikaEvent{Params: map[string]string{"event_type": "purchase"}}, "event_type == purchase", true},
-		{"missing field", &model.MetrikaEvent{Status: "200"}, "status_code == 500", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if matchCondition(tt.cond, tt.ev) != tt.want {
-				t.Errorf("matchCondition(%q, %+v) = %v, want %v", tt.cond, tt.ev, !tt.want, tt.want)
+		metrics := strings.Split(q.Get("metrics"), ",")
+		var intervals [][]string
+		var totals [][]float64
+		for range metrics {
+			totals = append(totals, nil)
+		}
+		for h := date1; !h.After(end); h = h.Add(time.Hour) {
+			intervals = append(intervals, []string{h.Format("2006-01-02 15:04:05")})
+			for i, m := range metrics {
+				totals[i] = append(totals[i], f.value(m, h))
 			}
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{
+			"totals":         totals,
+			"time_intervals": intervals,
+			"sampled":        f.sampled,
 		})
-	}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
-func TestPageMatches(t *testing.T) {
-	tests := []struct {
-		pat  string
-		url  string
-		want bool
-	}{
-		{"/checkout*", "/checkout/step1", true},
-		{"/checkout*", "/checkout", true},
-		{"/checkout*", "/home", false},
-		{"*/api/*", "/v1/api/users", true},
-		{"*/api/*", "/users/42", false},
-		{"*", "/anything/here", true},
-		{"", "/anything", true},
-		{"/exact/path", "/exact/path", true},
-		{"/exact/path", "/exact/other", false},
+func (f *byTimeFake) lastRequest() url.Values {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.requests) == 0 {
+		return nil
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.pat+" vs "+tt.url, func(t *testing.T) {
-			if pageMatches(tt.pat, tt.url) != tt.want {
-				t.Errorf("pageMatches(%q, %q) = %v, want %v", tt.pat, tt.url, !tt.want, tt.want)
-			}
-		})
-	}
+	return f.requests[len(f.requests)-1]
 }
 
-func TestSplitCondition(t *testing.T) {
-	tests := []struct {
-		input string
-		want  []string
-	}{
-		{"status_code == 500", []string{"status_code ", "==", " 500"}},
-		{"page_url contains /checkout", []string{"page_url ", "contains", " /checkout"}},
-		{"revenue > 10000", []string{"revenue ", ">", " 10000"}},
-		{"revenue >= 500", []string{"revenue ", ">=", " 500"}},
-		{"incomplete", []string{"incomplete"}},
-	}
-
-	for _, tt := range tests {
-		got := splitCondition(tt.input)
-		if len(got) != len(tt.want) || (len(got) == 3 && got[1] != tt.want[1]) {
-			t.Errorf("split(%q) = %v, want %v", tt.input, got, tt.want)
-		}
-	}
+type evalHarness struct {
+	db        *model.DB
+	evaluator *Evaluator
+	router    *fakeRouter
+	counter   *model.Counter
+	fake      *byTimeFake
 }
 
-func TestEventField(t *testing.T) {
-	ev := &model.MetrikaEvent{
-		PageURL:  "/checkout",
-		Title:    "Checkout Page",
-		Status:   "500",
-		Revenue:  99.9,
-		OrderID:  "ORD-123",
-		ClientID: "c-42",
-		UserID:   "u-7",
-		GoalsID:  []string{"42", "99"},
-		Params:   map[string]string{"custom": "val"},
-	}
-
-	if eventField(ev, "page_url") != "/checkout" {
-		t.Errorf("field page_url: %q", eventField(ev, "page_url"))
-	}
-	if eventField(ev, "url") != "/checkout" {
-		t.Errorf("alias url: %q", eventField(ev, "url"))
-	}
-	if eventField(ev, "status_code") != "500" || eventField(ev, "status") != "500" {
-		t.Errorf("status: %q / %q", eventField(ev, "status_code"), eventField(ev, "status"))
-	}
-	if eventField(ev, "revenue") != "99.90" {
-		t.Errorf("revenue: %q", eventField(ev, "revenue"))
-	}
-	if eventField(ev, "goals_id") != "42,99" || eventField(ev, "goals") != "42,99" {
-		t.Errorf("goals: %q / %q", eventField(ev, "goals_id"), eventField(ev, "goals"))
-	}
-	if eventField(ev, "custom") != "val" {
-		t.Errorf("custom param: %q", eventField(ev, "custom"))
-	}
-	if eventField(ev, "nonexistent") != "" {
-		t.Errorf("missing field: %q", eventField(ev, "nonexistent"))
-	}
-}
-
-func TestEvaluatorAlertsOnThreshold(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 3,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	now := time.Now()
-	events := make([]*model.MetrikaEvent, 5)
-	for i := 0; i < 5; i++ {
-		events[i] = &model.MetrikaEvent{
-			EventTime: now.Add(time.Duration(-i) * time.Minute),
-			PageURL:   "/checkout",
-			Title:     "Checkout page",
-			Status:    "500",
-		}
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Fatalf("alerts delivered: got %d, want 1", len(router.alerts))
-	}
-	a := router.alerts[0]
-	if a.counterID != c.ID {
-		t.Errorf("alert counter_id: %d, want %d", a.counterID, c.ID)
-	}
-	if a.message == "" {
-		t.Error("alert message empty")
-	}
-}
-
-func TestEvaluatorDedupWithinCooldown(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 2,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	now := time.Now()
-	first := []*model.MetrikaEvent{
-		{EventTime: now, Status: "500"},
-		{EventTime: now.Add(-5 * time.Minute), Status: "500"},
-	}
-	if err := eval.Evaluate(context.Background(), c.ID, first); err != nil {
-		t.Fatalf("first evaluate: %v", err)
-	}
-
-	second := []*model.MetrikaEvent{
-		{EventTime: now.Add(-10 * time.Minute), Status: "500"},
-		{EventTime: now.Add(-11 * time.Minute), Status: "500"},
-	}
-	if err := eval.Evaluate(context.Background(), c.ID, second); err != nil {
-		t.Fatalf("second evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Errorf("alerts delivered: got %d, want 1 (deduped by cooldown)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorNoAlertBelowThreshold(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 5,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	now := time.Now()
-	events := make([]*model.MetrikaEvent, 3)
-	for i := 0; i < 3; i++ {
-		events[i] = &model.MetrikaEvent{
-			EventTime: now.Add(time.Duration(-i) * time.Minute),
-			Status:    "500",
-		}
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (3 events < threshold 5)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorDisabledTriggerIgnored(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-		Enabled:   false,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{Status: "500"}}
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (trigger disabled)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorMonitorScopedTrigger(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	monitor := &model.PageMonitor{
-		CounterID:  c.ID,
-		Name:       "Checkout",
-		URLPattern: "/checkout*",
-		Metrics:    []string{"visits", "bounces"},
-		Enabled:    true,
-	}
-	if err := db.CreateMonitor(context.Background(), monitor); err != nil {
-		t.Fatalf("create monitor: %v", err)
-	}
-
-	monitorID := monitor.ID
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		MonitorID: &monitorID,
-		Name:      "Checkout 500s",
-		Condition: "status_code == 500",
-		Threshold: 2,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	// Debug diagnostics.
-	trigs, _ := db.ListTriggers(context.Background(), c.ID)
-	mons, _ := db.ListMonitors(context.Background(), c.ID)
-	fmt.Printf("diagnose: triggers=%d monitors=%d\n", len(trigs), len(mons))
-	for _, tr := range trigs {
-		mid := "<nil>"
-		if tr.MonitorID != nil {
-			mid = fmt.Sprintf("%d", *tr.MonitorID)
-		}
-		fmt.Printf("  trigger id=%d monitor_id=%s enabled=%v\n", tr.ID, mid, tr.Enabled)
-	}
-	for _, m := range mons {
-		fmt.Printf("  monitor id=%d pattern=%q enabled=%v\n", m.ID, m.URLPattern, m.Enabled)
-	}
-
-	now := time.Now()
-	events := []*model.MetrikaEvent{
-		{EventTime: now, PageURL: "/checkout/step1", Status: "500"},
-		{EventTime: now.Add(-2 * time.Minute), PageURL: "/checkout/step2", Status: "500"},
-		{EventTime: now.Add(-3 * time.Minute), PageURL: "/home", Status: "500"}, // outside monitor
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Fatalf("alerts delivered: got %d, want 1", len(router.alerts))
-	}
-	// Alert message should mention 2 matched events (only checkout ones).
-	msg := router.alerts[0].message
-	if !containsStr(msg, "2") || !containsStr(msg, "threshold: 2") {
-		t.Errorf("alert message missing event count: %q", msg)
-	}
-}
-
-func TestEvaluatorMultipleTriggersOneCounter(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig1 := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 2,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	trig2 := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "Checkout visits",
-		Condition: "page_url contains /checkout",
-		Threshold: 50,
-		Window:    1440,
-		Cooldown:  60,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig1); err != nil {
-		t.Fatalf("create trigger1: %v", err)
-	}
-	if err := db.CreateTrigger(context.Background(), trig2); err != nil {
-		t.Fatalf("create trigger2: %v", err)
-	}
-
-	now := time.Now()
-	events := make([]*model.MetrikaEvent, 0, 52)
-	for i := 0; i < 3; i++ {
-		events = append(events, &model.MetrikaEvent{
-			EventTime: now.Add(time.Duration(-i) * time.Minute),
-			PageURL:   "/checkout",
-			Status:    "500",
-		})
-	}
-	for i := 0; i < 50; i++ {
-		events = append(events, &model.MetrikaEvent{
-			EventTime: now.Add(time.Duration(-10-i) * time.Minute),
-			PageURL:   "/checkout/step1",
-			Status:    "200",
-		})
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	// Both triggers should fire.
-	if len(router.alerts) != 2 {
-		t.Errorf("alerts delivered: got %d, want 2 (one per trigger)", len(router.alerts))
-		for i, a := range router.alerts {
-			t.Logf("  alert %d: counter=%d title=%q", i+1, a.counterID, a.title)
-		}
-	}
-}
-
-func TestEvaluatorOldEventsOutsideWindowIgnored(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 1,
-		Window:    5, // only last 5 minutes
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	// Events from 10 minutes ago — outside the 5-min window.
-	events := []*model.MetrikaEvent{
-		{EventTime: time.Now().Add(-10 * time.Minute), Status: "500"},
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (events outside window)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorRevenueCondition(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "High revenue",
-		Condition: "revenue > 1000",
-		Threshold: 2,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	// Revenue events with no window time → use explicit times inside the window.
-	now := time.Now()
-	events := []*model.MetrikaEvent{
-		{EventTime: now, Revenue: 1500},
-		{EventTime: now.Add(-5 * time.Minute), Revenue: 2000},
-		{EventTime: now.Add(-10 * time.Minute), Revenue: 500}, // below threshold — should not count
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Errorf("alerts delivered: got %d, want 1", len(router.alerts))
-	}
-}
-
-func TestEvaluatorAlertRecordedInDB(t *testing.T) {
-	eval, db, _ := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{EventTime: time.Now(), Status: "500"}}
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	alerts, err := db.RecentAlerts(context.Background(), c.ID, 10)
-	if err != nil || len(alerts) != 1 {
-		t.Errorf("alerts in db: got %d, want 1; err=%v", len(alerts), err)
-		return
-	}
-	if alerts[0].TriggerID != trig.ID || alerts[0].CounterID != c.ID {
-		t.Errorf("alert record: trigger=%d counter=%d", alerts[0].TriggerID, alerts[0].CounterID)
-	}
-}
-
-func TestMatchConditionWithFloatRevenue(t *testing.T) {
-	ev := &model.MetrikaEvent{Revenue: 99.9}
-	if !matchCondition("revenue > 50", ev) {
-		t.Error("revenue 99.9 should be > 50")
-	}
-	if matchCondition("revenue > 200", ev) {
-		t.Error("revenue 99.9 should not be > 200")
-	}
-	if !matchCondition("revenue < 200", ev) {
-		t.Error("revenue 99.9 should be < 200")
-	}
-	if matchCondition("revenue >= 200", ev) {
-		t.Error("revenue 99.9 should not be >= 200")
-	}
-}
-
-func TestMatchConditionWithIntRevenue(t *testing.T) {
-	ev := &model.MetrikaEvent{Revenue: 500}
-	if !matchCondition("revenue > 400", ev) {
-		t.Error("revenue 500 should be > 400")
-	}
-}
-
-func TestMatchConditionWithJSONNumber(t *testing.T) {
-	ev := &model.MetrikaEvent{Revenue: 750}
-	if !matchCondition("revenue > 700", ev) {
-		t.Error("revenue 750 should be > 700")
-	}
-}
-
-func TestEvaluatorLogsErrorOnAlertDeliveryFailure(t *testing.T) {
-	// The evaluator logs errors but continues — we verify no panic.
-	eval, db, _ := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{Status: "500"}}
-	// Should not panic even with a failing router.
-	err := eval.Evaluate(context.Background(), c.ID, events)
+func newEvalHarness(t *testing.T, fake *byTimeFake) *evalHarness {
+	t.Helper()
+	db, err := model.OpenDB(filepath.Join(t.TempDir(), "eval.db"))
 	if err != nil {
-		t.Errorf("evaluate failed: %v", err)
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	counter := testCounter()
+	if err := db.CreateCounter(context.Background(), counter); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+
+	router := &fakeRouter{}
+	cfg := &MetrikaConfig{BaseURL: fake.serve(t)}
+	return &evalHarness{db: db, evaluator: NewEvaluator(db, router, cfg), router: router, counter: counter, fake: fake}
+}
+
+func (h *evalHarness) addTrigger(t *testing.T, trigger *model.Trigger) *model.Trigger {
+	t.Helper()
+	trigger.CounterID = h.counter.ID
+	if trigger.BaselineWeeks == 0 {
+		trigger.BaselineWeeks = 4
+	}
+	trigger.Enabled = true
+	if err := h.db.CreateTrigger(context.Background(), trigger); err != nil {
+		t.Fatalf("CreateTrigger: %v", err)
+	}
+	return trigger
+}
+
+// tuesday3pm is the hour under test in these cases.
+var tuesday3pm = time.Date(2026, 9, 8, 15, 0, 0, 0, time.Local)
+
+// steadyExcept returns a value function that reports `normal` everywhere except
+// at the given hours.
+func steadyExcept(normal float64, overrides map[time.Time]float64) func(string, time.Time) float64 {
+	return func(_ string, at time.Time) float64 {
+		if v, ok := overrides[at]; ok {
+			return v
+		}
+		return normal
 	}
 }
 
-func TestEvaluatorWithEmptyEvents(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
+func TestVisitsDropFiresAlert(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 30})}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты упали", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
 
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
+	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
 	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "500 errors",
-		Condition: "status_code == 500",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
+	if fired != 1 {
+		t.Fatalf("fired = %d, want 1", fired)
 	}
 
-	// Empty event batch — should not alert.
-	if err := eval.Evaluate(context.Background(), c.ID, []*model.MetrikaEvent{}); err != nil {
-		t.Fatalf("evaluate empty: %v", err)
+	alert := h.router.last()
+	if !strings.Contains(alert.title, "Визиты") || !strings.Contains(alert.title, "упали") {
+		t.Errorf("title = %q", alert.title)
 	}
-
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (no events)", len(router.alerts))
+	// 30 against a baseline of 100 is a 70% drop.
+	if !strings.Contains(alert.title, "70%") {
+		t.Errorf("title should carry the size of the drop: %q", alert.title)
 	}
-}
-
-func TestEvaluatorWithNonExistentCounter(t *testing.T) {
-	eval, _, router := newTestEvaluator(t)
-
-	events := []*model.MetrikaEvent{{Status: "500"}}
-	err := eval.Evaluate(context.Background(), 9999, events)
-	if err == nil {
-		t.Error("evaluate with non-existent counter should fail")
-	}
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0", len(router.alerts))
-	}
-}
-
-func TestEvaluatorWithInvalidCondition(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "Bad condition",
-		Condition: "invalid condition without operator",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{Status: "500"}}
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	// Invalid condition should not match anything, so no alert.
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (invalid condition)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorWithRevenueThreshold(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "High revenue events",
-		Condition: "revenue > 1000",
-		Threshold: 2,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{
-		{EventTime: time.Now(), Revenue: 1500},
-		{EventTime: time.Now().Add(-5 * time.Minute), Revenue: 2000},
-		{EventTime: time.Now().Add(-10 * time.Minute), Revenue: 500}, // below threshold
-	}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Errorf("alerts delivered: got %d, want 1", len(router.alerts))
-	}
-}
-
-func TestEvaluatorWithRevenueThresholdFromFloat64(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "High revenue events",
-		Condition: "revenue > 1000",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{EventTime: time.Now(), Revenue: float64(1500.5)}}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	if len(router.alerts) != 1 {
-		t.Errorf("alerts delivered: got %d, want 1", len(router.alerts))
-	}
-}
-
-func TestEvaluatorWithRevenueThresholdFromInt(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "High revenue events",
-		Condition: "revenue > 1000",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{Revenue: 500.0}}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	// Revenue 500 should not trigger "revenue > 1000"
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (revenue 500 < 1000)", len(router.alerts))
-	}
-}
-
-func TestEvaluatorWithRevenueThresholdFromJSONNumber(t *testing.T) {
-	eval, db, router := newTestEvaluator(t)
-
-	c := &model.Counter{
-		Name:         "Test Shop",
-		CounterID:    "12345",
-		OAuthToken:   "test-token",
-		PollInterval: 60,
-	}
-	if err := db.CreateCounter(context.Background(), c); err != nil {
-		t.Fatalf("create counter: %v", err)
-	}
-
-	trig := &model.Trigger{
-		CounterID: c.ID,
-		Name:      "High revenue events",
-		Condition: "revenue > 1000",
-		Threshold: 1,
-		Window:    60,
-		Cooldown:  30,
-
-		Enabled: true,
-	}
-	if err := db.CreateTrigger(context.Background(), trig); err != nil {
-		t.Fatalf("create trigger: %v", err)
-	}
-
-	events := []*model.MetrikaEvent{{Revenue: 750.0}}
-
-	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
-		t.Fatalf("evaluate: %v", err)
-	}
-
-	// Revenue 750 should not trigger "revenue > 1000"
-	if len(router.alerts) != 0 {
-		t.Errorf("alerts delivered: got %d, want 0 (revenue 750 < 1000)", len(router.alerts))
-	}
-}
-
-// jsonNumber simulates json.Number from API responses.
-type jsonNumber float64
-
-func (n jsonNumber) Int64() (int64, error) {
-	return int64(n), nil
-}
-
-func (n jsonNumber) Float64() (float64, error) {
-	return float64(n), nil
-}
-
-// containsStr checks if s contains any of the substrings.
-func containsStr(s string, substrs ...string) bool {
-	for _, sub := range substrs {
-		if !containsAny(s, sub) {
-			return false
+	for _, want := range []string{"вторник", "Обычно в этот час", "100", "30"} {
+		if !strings.Contains(alert.message, want) {
+			t.Errorf("message is missing %q:\n%s", want, alert.message)
 		}
 	}
-	return true
 }
 
-func containsAny(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
+// A normal evening lull must not alert: it is normal for that hour.
+func TestQuietHourIsNotAnAnomaly(t *testing.T) {
+	// 03:00 always sees 5 visits; 15:00 always sees 500.
+	value := func(_ string, at time.Time) float64 {
+		if at.Hour() == 3 {
+			return 5
+		}
+		return 500
+	}
+	fake := &byTimeFake{value: value}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 3, Cooldown: 180,
+	})
+
+	night := time.Date(2026, 9, 8, 3, 0, 0, 0, time.Local)
+	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, night)
+	if err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+	if fired != 0 {
+		t.Fatalf("the nightly lull fired %d alert(s) — a flat threshold mistake", fired)
+	}
+}
+
+func TestRiseFiresOnlyForRiseRules(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 300})}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Падение", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if fired != 0 {
+		t.Fatalf("a drop rule fired on a spike")
+	}
+
+	h.addTrigger(t, &model.Trigger{
+		Name: "Всплеск", Metric: "visits", Direction: DirectionRise,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+	fired, _ = h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if fired != 1 {
+		t.Fatalf("fired = %d, want the rise rule to fire", fired)
+	}
+	if !strings.Contains(h.router.last().title, "выросли") {
+		t.Errorf("title = %q", h.router.last().title)
+	}
+}
+
+// Goals are the other thing worth alerting on: orders stopping is an incident
+// even while traffic looks fine.
+func TestGoalDropFiresAlert(t *testing.T) {
+	value := func(metric string, at time.Time) float64 {
+		if metric != "ym:s:goal42reaches" {
+			return 1000 // traffic is healthy
+		}
+		if at.Equal(tuesday3pm) {
+			return 1
+		}
+		return 20
+	}
+	fake := &byTimeFake{value: value}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Заказы просели", Metric: "goal:42", Direction: DirectionDrop,
+		DeviationPct: 50, MinBaseline: 5, Cooldown: 180,
+	})
+
+	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("fired = %d, want 1", fired)
+	}
+	if !strings.Contains(h.router.last().title, "Цель 42") {
+		t.Errorf("title = %q", h.router.last().title)
+	}
+}
+
+// Several rules on one counter must cost one API call, not one each.
+func TestTriggersShareOneRequest(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+	for i := range 5 {
+		h.addTrigger(t, &model.Trigger{
+			Name: fmt.Sprintf("Правило %d", i), Metric: "visits", Direction: DirectionDrop,
+			DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+		})
+	}
+
+	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.requests) != 1 {
+		t.Errorf("made %d requests for 5 rules on one metric, want 1", len(fake.requests))
+	}
+}
+
+// Distinct metrics travel in one request too, up to the API's limit.
+func TestDistinctMetricsShareOneRequest(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+	for _, metric := range []string{"visits", "users", "goal:42"} {
+		h.addTrigger(t, &model.Trigger{
+			Name: metric, Metric: metric, Direction: DirectionDrop,
+			DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+		})
+	}
+
+	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+
+	got := fake.lastRequest().Get("metrics")
+	for _, want := range []string{"ym:s:visits", "ym:s:users", "ym:s:goal42reaches"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("metrics %q is missing %s", got, want)
 		}
 	}
-	return false
-}
-
-// eventToString converts an event to a string for display.
-func eventToString(ev *model.MetrikaEvent) string {
-	var b strings.Builder
-	b.WriteString("Event: ")
-	b.WriteString(ev.PageURL)
-	b.WriteString(" (")
-	b.WriteString(ev.Title)
-	b.WriteString(")")
-	if ev.Revenue > 0 {
-		b.WriteString(", revenue: ")
-		b.WriteString(strconv.FormatFloat(ev.Revenue, 'f', 2, 64))
+	if len(fake.requests) != 1 {
+		t.Errorf("made %d requests, want 1", len(fake.requests))
 	}
-	return b.String()
 }
 
-// alertToString converts an alert record to a string for display.
-func alertToString(a *alertRecord) string {
-	var b strings.Builder
-	b.WriteString("Alert: ")
-	b.WriteString(a.title)
-	b.WriteString(" (counter: ")
-	b.WriteString(strconv.FormatInt(a.counterID, 10))
-	b.WriteString(")")
-	return b.String()
+// The requested window must span the deepest baseline any rule asks for.
+func TestRequestWindowCoversTheDeepestBaseline(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Короткая", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, BaselineWeeks: 2, Cooldown: 180,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Длинная", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, BaselineWeeks: 8, Cooldown: 180,
+	})
+
+	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+
+	date1, err := time.ParseInLocation("2006-01-02", fake.lastRequest().Get("date1"), time.Local)
+	if err != nil {
+		t.Fatalf("date1: %v", err)
+	}
+	if span := tuesday3pm.Sub(date1); span < 8*7*24*time.Hour {
+		t.Errorf("window spans %s, too short for an 8-week baseline", span)
+	}
+	if fake.lastRequest().Get("group") != GroupHour {
+		t.Errorf("group = %q, want hour", fake.lastRequest().Get("group"))
+	}
 }
 
-// renderAlertMessage formats an alert message for display.
-func renderAlertMessage(t *model.Trigger, matched int) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Trigger: %s\n", t.Name))
-	b.WriteString(fmt.Sprintf("Events matched: %d (threshold: %d)\n", matched, t.Threshold))
-	b.WriteString(fmt.Sprintf("Window: %d min | Cooldown: %d min\n", t.Window, t.Cooldown))
-	b.WriteString(fmt.Sprintf("Condition: `%s`", t.Condition))
-	return b.String()
+func TestCooldownSuppressesRepeatAlerts(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{
+		tuesday3pm:                20,
+		tuesday3pm.Add(time.Hour): 20,
+	})}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	if fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); fired != 1 {
+		t.Fatalf("first hour fired %d, want 1", fired)
+	}
+	if fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm.Add(time.Hour)); fired != 0 {
+		t.Errorf("the next hour alerted again despite a 180-minute cooldown")
+	}
+}
+
+func TestDisabledTriggerIsIgnored(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 1})}
+	h := newEvalHarness(t, fake)
+
+	trigger := h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+	if err := h.db.UpdateTrigger(context.Background(), trigger.ID, false); err != nil {
+		t.Fatalf("UpdateTrigger: %v", err)
+	}
+
+	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+	if fired != 0 {
+		t.Errorf("a disabled rule fired")
+	}
+	// A counter whose every rule is off should not call the API at all.
+	if len(fake.requests) != 0 {
+		t.Errorf("made %d requests with no enabled rules", len(fake.requests))
+	}
+}
+
+func TestFiredAlertIsPersisted(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 20})}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+
+	alerts, err := h.db.RecentAlerts(context.Background(), h.counter.ID, 10)
+	if err != nil {
+		t.Fatalf("RecentAlerts: %v", err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("stored %d alerts, want 1", len(alerts))
+	}
+	// The absolute figure that fired it is kept for the history view.
+	if alerts[0].EventCount != 20 {
+		t.Errorf("event_count = %d, want the observed 20", alerts[0].EventCount)
+	}
+}
+
+func TestSampledDataIsFlaggedInTheAlert(t *testing.T) {
+	fake := &byTimeFake{
+		value:   steadyExcept(100, map[time.Time]float64{tuesday3pm: 20}),
+		sampled: true,
+	}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+	if !strings.Contains(h.router.last().message, "семплированы") {
+		t.Errorf("a sampled figure was presented as exact:\n%s", h.router.last().message)
+	}
+}
+
+// A rule naming a metric that no longer resolves must not take the whole
+// counter's evaluation down with it.
+func TestBadMetricDoesNotStopOtherRules(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 20})}
+	h := newEvalHarness(t, fake)
+
+	h.addTrigger(t, &model.Trigger{
+		Name: "Сломанная", Metric: "goal:abc", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Рабочая", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateHour: %v", err)
+	}
+	if fired != 1 {
+		t.Errorf("fired = %d, want the working rule to still fire", fired)
+	}
 }

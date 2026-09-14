@@ -115,7 +115,7 @@ func TestCreateTriggerReadsCounterIDFromBody(t *testing.T) {
 	}
 
 	w := do(s, http.MethodPost, "/api/triggers",
-		`{"counter_id":1,"name":"Ошибки","condition":"status_code == 500","threshold":3,"window_minutes":15}`, "")
+		`{"counter_id":1,"name":"Визиты","metric":"visits","direction":"drop","deviation_percent":40}`, "")
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d: %s", w.Code, w.Body)
 	}
@@ -124,35 +124,16 @@ func TestCreateTriggerReadsCounterIDFromBody(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.CounterID != 1 || got.Name != "Ошибки" || got.Threshold != 3 {
+	if got.CounterID != 1 || got.Name != "Визиты" || got.DeviationPct != 40 {
 		t.Errorf("created trigger = %+v", got)
+	}
+	if got.Metric != "visits" || got.Direction != "drop" {
+		t.Errorf("rule = %+v", got)
 	}
 
 	triggers, err := db.ListTriggers(context.Background(), 1)
 	if err != nil || len(triggers) != 1 {
 		t.Fatalf("ListTriggers = %v, %v", triggers, err)
-	}
-}
-
-func TestCreateMonitorReadsCounterIDFromBody(t *testing.T) {
-	s, db := testServer(t, "")
-	if err := db.CreateCounter(context.Background(), &model.Counter{
-		Name: "n", CounterID: "1", OAuthToken: "t", PollInterval: 60,
-	}); err != nil {
-		t.Fatalf("CreateCounter: %v", err)
-	}
-
-	w := do(s, http.MethodPost, "/api/monitors", `{"counter_id":1,"name":"Чекаут","url_pattern":"/checkout*"}`, "")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("status = %d: %s", w.Code, w.Body)
-	}
-
-	monitors, err := db.ListMonitors(context.Background(), 1)
-	if err != nil || len(monitors) != 1 {
-		t.Fatalf("ListMonitors = %v, %v", monitors, err)
-	}
-	if monitors[0].URLPattern != "/checkout*" {
-		t.Errorf("url_pattern = %q", monitors[0].URLPattern)
 	}
 }
 
@@ -183,7 +164,7 @@ func TestEmptyListsAreArraysNotNull(t *testing.T) {
 		t.Fatalf("CreateCounter: %v", err)
 	}
 
-	for _, target := range []string{"/api/counters", "/api/alert-actions", "/api/alerts", "/api/monitors?counter_id=1", "/api/triggers?counter_id=1"} {
+	for _, target := range []string{"/api/counters", "/api/alert-actions", "/api/alerts", "/api/triggers?counter_id=1"} {
 		w := do(s, http.MethodGet, target, "", "")
 		if w.Code != http.StatusOK {
 			t.Errorf("%s: status = %d: %s", target, w.Code, w.Body)

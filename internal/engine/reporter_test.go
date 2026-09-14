@@ -249,7 +249,7 @@ func TestReportSnapshotIsStored(t *testing.T) {
 		t.Fatalf("ReportCounter: %v", err)
 	}
 
-	snapshot, err := reporter.db.GetSnapshot(context.Background(), counter.ID, nil, "hour", "2026-09-12T14")
+	snapshot, err := reporter.db.GetSnapshot(context.Background(), counter.ID, "hour", "2026-09-12T14")
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}

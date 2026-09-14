@@ -4,260 +4,245 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
-// Evaluator evaluates incoming events against configured triggers and creates alerts.
-type Evaluator struct {
-	db    *model.DB
-	alert AlertRouter // delivers alerts to configured actions
-}
-
+// AlertRouter delivers a fired alert.
 type AlertRouter interface {
 	Alert(ctx context.Context, counterID int64, title, message string) error
 }
 
-func NewEvaluator(db *model.DB, router AlertRouter) *Evaluator {
-	return &Evaluator{db: db, alert: router}
+// Evaluator judges one counter's completed hours against the weekly rhythm of
+// its own history.
+type Evaluator struct {
+	db    *model.DB
+	alert AlertRouter
+	cfg   *MetrikaConfig
 }
 
-// Evaluate processes a batch of events against all triggers.
-func (e *Evaluator) Evaluate(ctx context.Context, counterID int64, events []*model.MetrikaEvent) error {
-	triggers, err := e.db.ListTriggers(ctx, counterID)
+func NewEvaluator(db *model.DB, router AlertRouter, cfg *MetrikaConfig) *Evaluator {
+	return &Evaluator{db: db, alert: router, cfg: cfg}
+}
+
+// minSamples is how many past occurrences of a slot a baseline needs before it
+// is trusted. Below this the median says more about luck than about the site.
+const minSamples = 2
+
+// EvaluateHour judges every enabled trigger of a counter for the given hour and
+// reports how many alerts it delivered.
+func (e *Evaluator) EvaluateHour(ctx context.Context, counter *model.Counter, hour time.Time) (int, error) {
+	triggers, err := e.db.ListTriggers(ctx, counter.ID)
 	if err != nil {
-		return fmt.Errorf("list triggers: %w", err)
+		return 0, fmt.Errorf("list triggers: %w", err)
 	}
+
+	enabled := make([]model.Trigger, 0, len(triggers))
+	for _, t := range triggers {
+		if t.Enabled {
+			enabled = append(enabled, t)
+		}
+	}
+	if len(enabled) == 0 {
+		return 0, nil
+	}
+
+	series, index, err := e.fetchSeries(ctx, counter, enabled, hour)
+	if err != nil {
+		return 0, err
+	}
+
+	var fired int
+	for _, t := range enabled {
+		delivered, err := e.evaluateTrigger(ctx, counter, &t, series, index, hour)
+		if err != nil {
+			log.Printf("counter %s: trigger %d (%s): %v", counter.CounterID, t.ID, t.Name, err)
+			continue
+		}
+		if delivered {
+			fired++
+		}
+	}
+	return fired, nil
+}
+
+// fetchSeries pulls the hourly history every trigger of this counter needs, in
+// one request. The window has to reach back far enough to hold the deepest
+// baseline any trigger asks for, and the metrics are deduplicated so a counter
+// with ten visit triggers still costs one call.
+func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, triggers []model.Trigger, hour time.Time) (*TimeSeries, map[string]int, error) {
+	index := make(map[string]int)
+	var metrics []string
+	weeks := 1
 
 	for _, t := range triggers {
-		if !t.Enabled {
-			continue
-		}
-
-		now := time.Now()
-		windowStart := now.Add(-time.Duration(t.Window) * time.Minute)
-
-		matched, err := e.matchEvents(ctx, &t, events, windowStart)
+		apiMetric, err := ResolveMetric(t.Metric)
 		if err != nil {
-			log.Printf("evaluate trigger %d: %v", t.ID, err)
+			log.Printf("counter %s: trigger %d (%s): %v", counter.CounterID, t.ID, t.Name, err)
 			continue
 		}
-		if matched < t.Threshold {
-			continue
+		if _, seen := index[apiMetric]; !seen {
+			index[apiMetric] = len(metrics)
+			metrics = append(metrics, apiMetric)
 		}
-
-		if err := e.checkCooldown(ctx, &t); err != nil {
-			continue // still in cooldown
-		}
-
-		counter, err := e.db.GetCounter(ctx, counterID)
-		if err != nil {
-			log.Printf("get counter %d: %v", counterID, err)
-			continue
-		}
-
-		title := fmt.Sprintf("🔴 Alert: %s — %s", counter.Name, t.Name)
-		msg := e.renderAlert(&t, matched)
-
-		if err := e.alert.Alert(ctx, counterID, title, msg); err != nil {
-			log.Printf("deliver alert: %v", err)
-		}
-
-		// Persist the alert.
-		a := &model.Alert{
-			TriggerID:  t.ID,
-			CounterID:  counterID,
-			Title:      title,
-			Message:    msg,
-			EventCount: matched,
-		}
-		if err := e.db.CreateAlert(ctx, a); err != nil {
-			log.Printf("persist alert: %v", err)
-		}
-
-		if err := e.db.RecordTriggerFire(ctx, t.ID); err != nil {
-			log.Printf("record trigger fire: %v", err)
+		if t.BaselineWeeks > weeks {
+			weeks = t.BaselineWeeks
 		}
 	}
-
-	return nil
-}
-
-// matchEvents counts events matching a trigger's condition within the window.
-func (e *Evaluator) matchEvents(ctx context.Context, t *model.Trigger, events []*model.MetrikaEvent, windowStart time.Time) (int, error) {
-	// Monitor-scoped triggers restrict matching to one page pattern. Resolve it
-	// once: a poll delivers thousands of events, and looking the monitor up per
-	// event meant thousands of identical queries per trigger.
-	var pattern string
-	if t.MonitorID != nil {
-		monitor, err := e.getMonitorForTrigger(ctx, t.CounterID, *t.MonitorID)
-		if err != nil {
-			return 0, err
-		}
-		// A missing or disabled monitor scopes the trigger to nothing.
-		if monitor == nil {
-			return 0, nil
-		}
-		pattern = monitor.URLPattern
+	if len(metrics) == 0 {
+		return nil, nil, fmt.Errorf("no trigger names a usable metric")
+	}
+	// The API caps a request at 20 metrics.
+	if len(metrics) > 20 {
+		return nil, nil, fmt.Errorf("counter watches %d distinct metrics, the API allows 20 per request", len(metrics))
 	}
 
-	count := 0
-	for _, ev := range events {
-		if ev.EventTime.Before(windowStart) {
-			continue
-		}
-		if t.MonitorID != nil && !pageMatches(pattern, ev.PageURL) {
-			continue
-		}
-		if matchCondition(t.Condition, ev) {
-			count++
-		}
-	}
-	return count, nil
-}
+	// Reach one day past the oldest week so the slot at the far end is whole.
+	from := hour.AddDate(0, 0, -7*weeks-1)
+	client := NewReportClient(counter, e.cfg.BaseURL)
 
-func (e *Evaluator) getMonitorForTrigger(ctx context.Context, counterID int64, monitorID int64) (*model.PageMonitor, error) {
-	monitors, err := e.db.ListMonitors(ctx, counterID)
+	series, err := client.FetchByTime(ctx, metrics, from.Format("2006-01-02"), hour.Format("2006-01-02"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	for _, m := range monitors {
-		if m.ID == monitorID && m.Enabled {
-			return &m, nil
-		}
-	}
-	return nil, nil
+	return series, index, nil
 }
 
-func (e *Evaluator) checkCooldown(ctx context.Context, t *model.Trigger) error {
+// evaluateTrigger judges one trigger and delivers an alert when it fires.
+func (e *Evaluator) evaluateTrigger(ctx context.Context, counter *model.Counter, t *model.Trigger, series *TimeSeries, index map[string]int, hour time.Time) (bool, error) {
+	apiMetric, err := ResolveMetric(t.Metric)
+	if err != nil {
+		return false, err
+	}
+	metricIdx, ok := index[apiMetric]
+	if !ok {
+		return false, fmt.Errorf("metric %s missing from the series", apiMetric)
+	}
+
+	hourIdx := series.IndexOf(hour)
+	if hourIdx < 0 {
+		return false, fmt.Errorf("hour %s is not in the returned series", hour.Format(time.RFC3339))
+	}
+	current, ok := series.At(metricIdx, hourIdx)
+	if !ok {
+		return false, fmt.Errorf("no value for %s at %s", apiMetric, hour.Format(time.RFC3339))
+	}
+
+	baseline := BuildBaseline(series, metricIdx, hour)
+	verdict := Judge(current, baseline, t.Direction, t.DeviationPct, t.MinBaseline, minSamples)
+
+	if !verdict.Fired {
+		return false, nil
+	}
+	if inCooldown, err := e.inCooldown(ctx, t); err != nil {
+		return false, err
+	} else if inCooldown {
+		return false, nil
+	}
+
+	title := e.buildTitle(counter, t, verdict)
+	message := e.buildMessage(t, verdict, hour, series.Sampled)
+
+	if err := e.alert.Alert(ctx, counter.ID, title, message); err != nil {
+		log.Printf("counter %s: deliver alert for trigger %d: %v", counter.CounterID, t.ID, err)
+	}
+
+	record := &model.Alert{
+		TriggerID: t.ID,
+		CounterID: counter.ID,
+		Title:     title,
+		Message:   message,
+		// The absolute figure that fired the alert, kept for the history view.
+		EventCount: int(verdict.Current),
+	}
+	if err := e.db.CreateAlert(ctx, record); err != nil {
+		log.Printf("counter %s: persist alert: %v", counter.CounterID, err)
+	}
+	if err := e.db.RecordTriggerFire(ctx, t.ID); err != nil {
+		log.Printf("counter %s: record trigger fire: %v", counter.CounterID, err)
+	}
+	return true, nil
+}
+
+func (e *Evaluator) inCooldown(ctx context.Context, t *model.Trigger) (bool, error) {
 	lastFired, ok, err := e.db.TriggerFiredAt(ctx, t.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if !ok || time.Since(lastFired) >= time.Duration(t.Cooldown)*time.Minute {
-		return nil
+	if !ok {
+		return false, nil
 	}
-	return fmt.Errorf("trigger %d in cooldown until %s", t.ID, lastFired.Format(time.RFC3339))
+	return time.Since(lastFired) < time.Duration(t.Cooldown)*time.Minute, nil
 }
 
-func (e *Evaluator) renderAlert(t *model.Trigger, matched int) string {
+func (e *Evaluator) buildTitle(counter *model.Counter, t *model.Trigger, v Verdict) string {
+	arrow := "📉"
+	if v.DeviationPct > 0 {
+		arrow = "📈"
+	}
+	return fmt.Sprintf("%s %s: %s %s на %.0f%%",
+		arrow, counter.Name, MetricLabel(t.Metric), changeVerb(t.Metric, v.DeviationPct), absPct(v.DeviationPct))
+}
+
+// changeVerb agrees with the metric's own label. Every metric name is plural
+// ("Визиты упали") except a single goal, which is feminine singular
+// ("Цель 42 упала").
+func changeVerb(metric string, deviationPct float64) string {
+	singularFeminine := strings.HasPrefix(strings.ToLower(strings.TrimSpace(metric)), goalPrefix)
+
+	if deviationPct > 0 {
+		if singularFeminine {
+			return "выросла"
+		}
+		return "выросли"
+	}
+	if singularFeminine {
+		return "упала"
+	}
+	return "упали"
+}
+
+func (e *Evaluator) buildMessage(t *model.Trigger, v Verdict, hour time.Time, sampled bool) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("*Trigger:* %s\n", t.Name))
-	b.WriteString(fmt.Sprintf("*Events matched:* %d (threshold: %d)\n", matched, t.Threshold))
-	b.WriteString(fmt.Sprintf("*Window:* %d min | *Cooldown:* %d min\n", t.Window, t.Cooldown))
-	b.WriteString(fmt.Sprintf("*Condition:* `%s`", t.Condition))
+
+	fmt.Fprintf(&b, "*Правило:* %s\n", t.Name)
+	fmt.Fprintf(&b, "*Час:* %s, %s\n", hour.Format("02.01 15:00"), weekdayName(hour.Weekday()))
+	fmt.Fprintf(&b, "*%s:* %.0f\n", MetricLabel(t.Metric), v.Current)
+	fmt.Fprintf(&b, "*Обычно в этот час:* %.0f\n", v.Baseline.Value)
+	fmt.Fprintf(&b, "*Отклонение:* %+.0f%% при пороге %d%%\n", v.DeviationPct, t.DeviationPct)
+	fmt.Fprintf(&b, "\n_База — медиана %d последних %s в этот час._",
+		v.Baseline.Samples, pluralWeekday(v.Baseline.Samples, hour.Weekday()))
+
+	if sampled {
+		b.WriteString("\n_Данные семплированы._")
+	}
 	return b.String()
 }
 
-// matchCondition evaluates a simple condition string against an event.
-// Supported: "field op value" — e.g. "status_code == 500", "revenue > 10000",
-// "page_url contains /checkout", "goals_id contains 42".
-func matchCondition(cond string, ev *model.MetrikaEvent) bool {
-	cond = strings.TrimSpace(cond)
-	if cond == "" {
-		return true
+func absPct(v float64) float64 {
+	if v < 0 {
+		return -v
 	}
+	return v
+}
 
-	parts := splitCondition(cond)
-	if len(parts) < 3 {
-		return false
-	}
-
-	field := strings.ToLower(strings.TrimSpace(parts[0]))
-	op := strings.TrimSpace(parts[1])
-	value := strings.TrimSpace(parts[2])
-
-	fieldVal := eventField(ev, field)
-
-	switch op {
-	case "==":
-		return fieldVal == value
-	case "!=":
-		return fieldVal != value
-	case "contains":
-		return strings.Contains(strings.ToLower(fieldVal), strings.ToLower(value))
-	case ">":
-		f1, e1 := strconv.ParseFloat(fieldVal, 64)
-		f2, e2 := strconv.ParseFloat(value, 64)
-		return e1 == nil && e2 == nil && f1 > f2
-	case "<":
-		f1, e1 := strconv.ParseFloat(fieldVal, 64)
-		f2, e2 := strconv.ParseFloat(value, 64)
-		return e1 == nil && e2 == nil && f1 < f2
-	case ">=":
-		f1, e1 := strconv.ParseFloat(fieldVal, 64)
-		f2, e2 := strconv.ParseFloat(value, 64)
-		return e1 == nil && e2 == nil && f1 >= f2
-	case "<=":
-		f1, e1 := strconv.ParseFloat(fieldVal, 64)
-		f2, e2 := strconv.ParseFloat(value, 64)
-		return e1 == nil && e2 == nil && f1 <= f2
+// pluralWeekday renders "вторников" / "вторника" so the alert text reads
+// naturally for any sample count.
+func pluralWeekday(n int, d time.Weekday) string {
+	name := weekdayName(d)
+	switch name {
+	case "среда":
+		name = "сред"
+	case "пятница":
+		name = "пятниц"
+	case "суббота":
+		name = "суббот"
+	case "воскресенье":
+		name = "воскресений"
 	default:
-		return fieldVal == value
+		name += "ов"
 	}
-}
-
-func eventField(ev *model.MetrikaEvent, field string) string {
-	switch field {
-	case "page_url", "url":
-		return ev.PageURL
-	case "title":
-		return ev.Title
-	case "status_code", "status":
-		return ev.Status
-	case "revenue":
-		return fmt.Sprintf("%.2f", ev.Revenue)
-	case "order_id":
-		return ev.OrderID
-	case "client_id":
-		return ev.ClientID
-	case "user_id":
-		return ev.UserID
-	case "goals_id", "goals":
-		return strings.Join(ev.GoalsID, ",")
-	default:
-		if v, ok := ev.Params[field]; ok {
-			return v
-		}
-		return ""
-	}
-}
-
-func splitCondition(cond string) []string {
-	// Split on first occurrence of ==, !=, contains, >, <, >=, <=.
-	for _, op := range []string{"contains", "==", "!=", ">=", "<=", ">", "<"} {
-		if idx := strings.Index(cond, op); idx > 0 {
-			return []string{cond[:idx], op, cond[idx+len(op):]}
-		}
-	}
-	return []string{cond}
-}
-
-// pageMatches checks if a URL matches a glob-like pattern.
-// Supports * as wildcard: "/checkout*", "*/api/*".
-func pageMatches(pattern, url string) bool {
-	if pattern == "" || pattern == "*" {
-		return true
-	}
-	// Simple glob: split on *, check segments.
-	parts := strings.Split(pattern, "*")
-	if len(parts) == 1 {
-		return url == pattern
-	}
-
-	if !strings.HasPrefix(url, parts[0]) {
-		return false
-	}
-	remaining := url[len(parts[0]):]
-	for _, part := range parts[1:] {
-		idx := strings.Index(remaining, part)
-		if idx < 0 {
-			return false
-		}
-		remaining = remaining[idx+len(part):]
-	}
-	return true
+	return name
 }

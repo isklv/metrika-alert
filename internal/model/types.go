@@ -14,35 +14,36 @@ type Counter struct {
 	// and a GET /api/counters must not hand out Metrika credentials.
 	OAuthToken   string `json:"-"`
 	PollInterval int    `json:"poll_interval_minutes"` // how often to poll Logs API, minutes
-	// LastEventAt is the newest event already evaluated. Nil on a counter that
-	// has never been polled.
-	LastEventAt *time.Time `json:"last_event_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	// LastHourChecked is the start of the most recent hour already judged.
+	// Nil on a counter that has never been polled.
+	LastHourChecked *time.Time `json:"last_hour_checked,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
-// PageMonitor monitors a specific page pattern under a counter.
-type PageMonitor struct {
-	ID         int64     `json:"id"`
-	CounterID  int64     `json:"counter_id"`
-	Name       string    `json:"name"`
-	URLPattern string    `json:"url_pattern"` // glob pattern, e.g. "/checkout*"
-	Metrics    []string  `json:"metrics"`     // which metrics to track: visits, bounces, goals, revenue, errors
-	Enabled    bool      `json:"enabled"`
-	CreatedAt  time.Time `json:"created_at"`
-}
-
-// Trigger defines a condition that fires an alert.
+// Trigger fires when an hourly metric departs from what that slot in the week
+// normally looks like.
+//
+// The comparison is per hour and per weekday because traffic has a strong
+// weekly rhythm: a quiet Sunday 03:00 is normal, the same figure on Tuesday at
+// noon is an incident. A flat threshold cannot tell those apart.
 type Trigger struct {
-	ID        int64     `json:"id"`
-	CounterID int64     `json:"counter_id"`
-	MonitorID *int64    `json:"monitor_id,omitempty"` // nil = applies to whole counter
-	Name      string    `json:"name"`
-	Condition string    `json:"condition"`        // event condition, e.g. "status_code == 500"
-	Threshold int       `json:"threshold"`        // minimum event count in window to fire
-	Window    int       `json:"window_minutes"`   // evaluation window in minutes
-	Cooldown  int       `json:"cooldown_minutes"` // min minutes between repeated alerts for same trigger
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64  `json:"id"`
+	CounterID int64  `json:"counter_id"`
+	Name      string `json:"name"`
+	// Metric is written as visits, users, pageviews, goals or goal:<id>.
+	Metric string `json:"metric"`
+	// Direction is drop, rise or both.
+	Direction string `json:"direction"`
+	// DeviationPct is how far from the baseline, in percent, counts as an anomaly.
+	DeviationPct int `json:"deviation_percent"`
+	// MinBaseline is a noise floor: slots quieter than this are never alerted
+	// on, because one visit fewer out of two is a 50% drop and means nothing.
+	MinBaseline int `json:"min_baseline"`
+	// BaselineWeeks is how many earlier occurrences of the slot form the baseline.
+	BaselineWeeks int       `json:"baseline_weeks"`
+	Cooldown      int       `json:"cooldown_minutes"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // Alert is a fired notification.
@@ -97,31 +98,4 @@ func (a AlertAction) Destination() string {
 	default:
 		return a.URL
 	}
-}
-
-// MetrikaEvent represents a single event from Logs API.
-type MetrikaEvent struct {
-	CounterID string            `json:"counter_id"`
-	EventTime time.Time         `json:"event_time"`
-	PageURL   string            `json:"page_url"`
-	Title     string            `json:"title"`
-	GoalsID   []string          `json:"goals_id"`
-	Status    string            `json:"status_code"`
-	Revenue   float64           `json:"revenue"`
-	OrderID   string            `json:"order_id"`
-	ClientID  string            `json:"client_id"`
-	UserID    string            `json:"user_id"`
-	Params    map[string]string `json:"params"`
-}
-
-// LogRequest tracks one asynchronous Logs API export through its lifecycle.
-type LogRequest struct {
-	ID        int64     `json:"id"`
-	CounterID int64     `json:"counter_id"`
-	RequestID int64     `json:"request_id"`
-	Date1     time.Time `json:"date1"`
-	Date2     time.Time `json:"date2"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
 }

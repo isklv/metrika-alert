@@ -175,23 +175,23 @@ func TestDefaultMetrikaHostIsTheDocumentedOne(t *testing.T) {
 	if cfg.Metrika.BaseURL != "https://api-metrika.yandex.net" {
 		t.Errorf("base_url = %q", cfg.Metrika.BaseURL)
 	}
-	if cfg.Metrika.LagHours < 24 {
-		t.Errorf("lag_hours = %d — the Logs API refuses a window ending today", cfg.Metrika.LagHours)
+	if cfg.Metrika.SettleMinutes <= 0 {
+		t.Errorf("settle_minutes = %d — a closed hour needs time to settle before it is judged", cfg.Metrika.SettleMinutes)
 	}
 }
 
-func TestLogsPacingOverrides(t *testing.T) {
-	t.Setenv("METRIKA_LAG_HOURS", "48")
-	t.Setenv("METRIKA_MAX_WINDOW_HOURS", "6")
+func TestHourlyPacingOverrides(t *testing.T) {
+	t.Setenv("METRIKA_SETTLE_MINUTES", "45")
+	t.Setenv("METRIKA_MAX_CATCH_UP_HOURS", "3")
 
-	cfg, err := Load(writeConfig(t, "metrika:\n  lag_hours: 30\n"))
+	cfg, err := Load(writeConfig(t, "metrika:\n  settle_minutes: 15\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Metrika.LagHours != 48 {
-		t.Errorf("lag_hours = %d, want the env override", cfg.Metrika.LagHours)
+	if cfg.Metrika.SettleMinutes != 45 {
+		t.Errorf("settle_minutes = %d, want the env override", cfg.Metrika.SettleMinutes)
 	}
-	if cfg.Metrika.MaxWindowHours != 6 {
-		t.Errorf("max_window_hours = %d", cfg.Metrika.MaxWindowHours)
+	if cfg.Metrika.MaxCatchUpHours != 3 {
+		t.Errorf("max_catch_up_hours = %d", cfg.Metrika.MaxCatchUpHours)
 	}
 }

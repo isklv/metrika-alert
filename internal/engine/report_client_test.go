@@ -7,7 +7,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/isklv/metrika-alert/internal/model"
 )
+
+func testCounter() *model.Counter {
+	return &model.Counter{ID: 1, Name: "Магазин", CounterID: "12345678", OAuthToken: "y0_token", PollInterval: 60}
+}
 
 func reportStub(t *testing.T, body string, capture **http.Request) *ReportClient {
 	t.Helper()

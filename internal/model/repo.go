@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -38,7 +37,7 @@ func (db *DB) CreateCounter(ctx context.Context, c *Counter) error {
 }
 
 func (db *DB) ListCounters(ctx context.Context) ([]Counter, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, name, counter_id, oauth_token, poll_interval_minutes, last_event_at, created_at FROM counters ORDER BY id`)
+	rows, err := db.QueryContext(ctx, `SELECT id, name, counter_id, oauth_token, poll_interval_minutes, last_hour_checked, created_at FROM counters ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list counters: %w", err)
 	}
@@ -47,12 +46,12 @@ func (db *DB) ListCounters(ctx context.Context) ([]Counter, error) {
 	var out []Counter
 	for rows.Next() {
 		var c Counter
-		var lastEvent sql.NullTime
-		if err := rows.Scan(&c.ID, &c.Name, &c.CounterID, &c.OAuthToken, &c.PollInterval, &lastEvent, &c.CreatedAt); err != nil {
+		var lastHour sql.NullTime
+		if err := rows.Scan(&c.ID, &c.Name, &c.CounterID, &c.OAuthToken, &c.PollInterval, &lastHour, &c.CreatedAt); err != nil {
 			return nil, err
 		}
-		if lastEvent.Valid {
-			c.LastEventAt = &lastEvent.Time
+		if lastHour.Valid {
+			c.LastHourChecked = &lastHour.Time
 		}
 		out = append(out, c)
 	}
@@ -61,18 +60,18 @@ func (db *DB) ListCounters(ctx context.Context) ([]Counter, error) {
 
 func (db *DB) GetCounter(ctx context.Context, id int64) (*Counter, error) {
 	var c Counter
-	var lastEvent sql.NullTime
+	var lastHour sql.NullTime
 	err := db.QueryRowContext(ctx,
-		`SELECT id, name, counter_id, oauth_token, poll_interval_minutes, last_event_at, created_at FROM counters WHERE id = ?`, id,
-	).Scan(&c.ID, &c.Name, &c.CounterID, &c.OAuthToken, &c.PollInterval, &lastEvent, &c.CreatedAt)
+		`SELECT id, name, counter_id, oauth_token, poll_interval_minutes, last_hour_checked, created_at FROM counters WHERE id = ?`, id,
+	).Scan(&c.ID, &c.Name, &c.CounterID, &c.OAuthToken, &c.PollInterval, &lastHour, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("counter %d not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get counter: %w", err)
 	}
-	if lastEvent.Valid {
-		c.LastEventAt = &lastEvent.Time
+	if lastHour.Valid {
+		c.LastHourChecked = &lastHour.Time
 	}
 	return &c, nil
 }
@@ -88,10 +87,8 @@ func (db *DB) DeleteCounter(ctx context.Context, id int64) error {
 	defer tx.Rollback()
 
 	stmts := []string{
-		`DELETE FROM log_requests WHERE counter_id = ?`,
 		`DELETE FROM trigger_cooldowns WHERE trigger_id IN (SELECT id FROM triggers WHERE counter_id = ?)`,
 		`DELETE FROM triggers WHERE counter_id = ?`,
-		`DELETE FROM page_monitors WHERE counter_id = ?`,
 		`DELETE FROM report_snapshots WHERE counter_id = ?`,
 		`DELETE FROM alerts WHERE counter_id = ?`,
 		`DELETE FROM counters WHERE id = ?`,
@@ -104,70 +101,22 @@ func (db *DB) DeleteCounter(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-// ---- PageMonitors ----
-
-func (db *DB) CreateMonitor(ctx context.Context, m *PageMonitor) error {
-	metrics := strings.Join(m.Metrics, ",")
-	res, err := db.ExecContext(ctx,
-		`INSERT INTO page_monitors (counter_id, name, url_pattern, metrics, enabled) VALUES (?, ?, ?, ?, ?)`,
-		m.CounterID, m.Name, m.URLPattern, metrics, m.Enabled,
-	)
-	if err != nil {
-		return fmt.Errorf("create monitor: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	m.ID = id
-	m.CreatedAt = time.Now()
-	return nil
-}
-
-func (db *DB) ListMonitors(ctx context.Context, counterID int64) ([]PageMonitor, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, counter_id, name, url_pattern, metrics, enabled, created_at FROM page_monitors WHERE counter_id = ? ORDER BY id`, counterID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list monitors: %w", err)
-	}
-	defer rows.Close()
-
-	var out []PageMonitor
-	for rows.Next() {
-		var m PageMonitor
-		var metricsStr string
-		if err := rows.Scan(&m.ID, &m.CounterID, &m.Name, &m.URLPattern, &metricsStr, &m.Enabled, &m.CreatedAt); err != nil {
-			return nil, err
-		}
-		m.Metrics = strings.Split(metricsStr, ",")
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
-
-func (db *DB) UpdateMonitor(ctx context.Context, id int64, enabled bool) error {
-	_, err := db.ExecContext(ctx, `UPDATE page_monitors SET enabled = ? WHERE id = ?`, enabled, id)
-	if err != nil {
-		return fmt.Errorf("update monitor: %w", err)
-	}
-	return nil
-}
-
-func (db *DB) DeleteMonitor(ctx context.Context, id int64) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM page_monitors WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete monitor: %w", err)
-	}
-	return nil
-}
-
 // ---- Triggers ----
+
+const triggerColumns = `id, counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, cooldown_minutes, enabled, created_at`
+
+func scanTrigger(row interface{ Scan(...any) error }) (Trigger, error) {
+	var t Trigger
+	err := row.Scan(&t.ID, &t.CounterID, &t.Name, &t.Metric, &t.Direction,
+		&t.DeviationPct, &t.MinBaseline, &t.BaselineWeeks, &t.Cooldown, &t.Enabled, &t.CreatedAt)
+	return t, err
+}
 
 func (db *DB) CreateTrigger(ctx context.Context, t *Trigger) error {
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO triggers (counter_id, monitor_id, name, condition, threshold, window_minutes, cooldown_minutes, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.CounterID, nullInt64(t.MonitorID), t.Name, t.Condition, t.Threshold, t.Window, t.Cooldown, t.Enabled,
+		`INSERT INTO triggers (counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, cooldown_minutes, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.CounterID, t.Name, t.Metric, t.Direction, t.DeviationPct, t.MinBaseline, t.BaselineWeeks, t.Cooldown, t.Enabled,
 	)
 	if err != nil {
 		return fmt.Errorf("create trigger: %w", err)
@@ -190,8 +139,7 @@ func (db *DB) ListTriggers(ctx context.Context, counterID int64) ([]Trigger, err
 	}
 
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, counter_id, monitor_id, name, condition, threshold, window_minutes, cooldown_minutes, enabled, created_at FROM triggers WHERE counter_id = ? ORDER BY id`, counterID,
-	)
+		`SELECT `+triggerColumns+` FROM triggers WHERE counter_id = ? ORDER BY id`, counterID)
 	if err != nil {
 		return nil, fmt.Errorf("list triggers: %w", err)
 	}
@@ -199,13 +147,9 @@ func (db *DB) ListTriggers(ctx context.Context, counterID int64) ([]Trigger, err
 
 	var out []Trigger
 	for rows.Next() {
-		var t Trigger
-		var mid sql.NullInt64
-		if err := rows.Scan(&t.ID, &t.CounterID, &mid, &t.Name, &t.Condition, &t.Threshold, &t.Window, &t.Cooldown, &t.Enabled, &t.CreatedAt); err != nil {
+		t, err := scanTrigger(rows)
+		if err != nil {
 			return nil, err
-		}
-		if mid.Valid {
-			t.MonitorID = &mid.Int64
 		}
 		out = append(out, t)
 	}
@@ -213,19 +157,13 @@ func (db *DB) ListTriggers(ctx context.Context, counterID int64) ([]Trigger, err
 }
 
 func (db *DB) GetTrigger(ctx context.Context, id int64) (*Trigger, error) {
-	var t Trigger
-	var mid sql.NullInt64
-	err := db.QueryRowContext(ctx,
-		`SELECT id, counter_id, monitor_id, name, condition, threshold, window_minutes, cooldown_minutes, enabled, created_at FROM triggers WHERE id = ?`, id,
-	).Scan(&t.ID, &t.CounterID, &mid, &t.Name, &t.Condition, &t.Threshold, &t.Window, &t.Cooldown, &t.Enabled, &t.CreatedAt)
+	row := db.QueryRowContext(ctx, `SELECT `+triggerColumns+` FROM triggers WHERE id = ?`, id)
+	t, err := scanTrigger(row)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("trigger %d not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get trigger: %w", err)
-	}
-	if mid.Valid {
-		t.MonitorID = &mid.Int64
 	}
 	return &t, nil
 }
@@ -378,8 +316,8 @@ func (db *DB) CreateReportSnapshot(ctx context.Context, s *ReportSnapshot) error
 		return fmt.Errorf("marshal goals: %w", err)
 	}
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO report_snapshots (counter_id, monitor_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.CounterID, nullInt64(s.MonitorID), s.Period, s.PeriodKey, s.TakenAt, s.Visits, s.UniqueVisits, s.Bounces, s.AvgDuration, s.Depth, string(goalsJSON), s.Revenue, s.Orders,
+		`INSERT INTO report_snapshots (counter_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.CounterID, s.Period, s.PeriodKey, s.TakenAt, s.Visits, s.UniqueVisits, s.Bounces, s.AvgDuration, s.Depth, string(goalsJSON), s.Revenue, s.Orders,
 	)
 	if err != nil {
 		return fmt.Errorf("create report snapshot: %w", err)
@@ -392,29 +330,17 @@ func (db *DB) CreateReportSnapshot(ctx context.Context, s *ReportSnapshot) error
 	return nil
 }
 
-func (db *DB) GetSnapshot(ctx context.Context, counterID int64, monitorID *int64, period, key string) (*ReportSnapshot, error) {
+const snapshotColumns = `id, counter_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders`
+
+func (db *DB) GetSnapshot(ctx context.Context, counterID int64, period, key string) (*ReportSnapshot, error) {
 	var s ReportSnapshot
 	var goalsJSON string
-	var mid sql.NullInt64
-	if monitorID != nil {
-		err := db.QueryRowContext(ctx,
-			`SELECT id, counter_id, monitor_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders FROM report_snapshots WHERE counter_id = ? AND monitor_id = ? AND period = ? AND period_key = ?`,
-			counterID, *monitorID, period, key,
-		).Scan(&s.ID, &s.CounterID, &mid, &s.Period, &s.PeriodKey, &s.TakenAt, &s.Visits, &s.UniqueVisits, &s.Bounces, &s.AvgDuration, &s.Depth, &goalsJSON, &s.Revenue, &s.Orders)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		err := db.QueryRowContext(ctx,
-			`SELECT id, counter_id, monitor_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders FROM report_snapshots WHERE counter_id = ? AND monitor_id IS NULL AND period = ? AND period_key = ?`,
-			counterID, period, key,
-		).Scan(&s.ID, &s.CounterID, &mid, &s.Period, &s.PeriodKey, &s.TakenAt, &s.Visits, &s.UniqueVisits, &s.Bounces, &s.AvgDuration, &s.Depth, &goalsJSON, &s.Revenue, &s.Orders)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if mid.Valid {
-		s.MonitorID = &mid.Int64
+	err := db.QueryRowContext(ctx,
+		`SELECT `+snapshotColumns+` FROM report_snapshots WHERE counter_id = ? AND period = ? AND period_key = ?`,
+		counterID, period, key,
+	).Scan(&s.ID, &s.CounterID, &s.Period, &s.PeriodKey, &s.TakenAt, &s.Visits, &s.UniqueVisits, &s.Bounces, &s.AvgDuration, &s.Depth, &goalsJSON, &s.Revenue, &s.Orders)
+	if err != nil {
+		return nil, err
 	}
 	if err := json.Unmarshal([]byte(goalsJSON), &s.Goals); err != nil {
 		return nil, fmt.Errorf("unmarshal goals: %w", err)
@@ -423,8 +349,9 @@ func (db *DB) GetSnapshot(ctx context.Context, counterID int64, monitorID *int64
 }
 
 func (db *DB) ListSnapshots(ctx context.Context, counterID int64, period string, limit int) ([]ReportSnapshot, error) {
-	const query = `SELECT id, counter_id, monitor_id, period, period_key, taken_at, visits, unique_visits, bounces, avg_duration_sec, avg_depth, goals, revenue, orders FROM report_snapshots WHERE counter_id = ? AND period = ? ORDER BY period_key DESC LIMIT ?`
-	rows, err := db.QueryContext(ctx, query, counterID, period, limit)
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+snapshotColumns+` FROM report_snapshots WHERE counter_id = ? AND period = ? ORDER BY period_key DESC LIMIT ?`,
+		counterID, period, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query snapshots: %w", err)
 	}
@@ -434,12 +361,8 @@ func (db *DB) ListSnapshots(ctx context.Context, counterID int64, period string,
 	for rows.Next() {
 		var s ReportSnapshot
 		var goalsJSON string
-		var mid sql.NullInt64
-		if err := rows.Scan(&s.ID, &s.CounterID, &mid, &s.Period, &s.PeriodKey, &s.TakenAt, &s.Visits, &s.UniqueVisits, &s.Bounces, &s.AvgDuration, &s.Depth, &goalsJSON, &s.Revenue, &s.Orders); err != nil {
+		if err := rows.Scan(&s.ID, &s.CounterID, &s.Period, &s.PeriodKey, &s.TakenAt, &s.Visits, &s.UniqueVisits, &s.Bounces, &s.AvgDuration, &s.Depth, &goalsJSON, &s.Revenue, &s.Orders); err != nil {
 			return nil, err
-		}
-		if mid.Valid {
-			s.MonitorID = &mid.Int64
 		}
 		json.Unmarshal([]byte(goalsJSON), &s.Goals)
 		out = append(out, s)
@@ -447,95 +370,14 @@ func (db *DB) ListSnapshots(ctx context.Context, counterID int64, period string,
 	return out, rows.Err()
 }
 
-// ---- Log requests ----
-//
-// A Logs API export is ordered in one poll and downloaded in a later one, so
-// its identity has to survive both the poll and the process.
+// ---- Hour cursor ----
 
-// CreateLogRequest records a newly ordered export.
-func (db *DB) CreateLogRequest(ctx context.Context, r *LogRequest) error {
-	res, err := db.ExecContext(ctx,
-		`INSERT INTO log_requests (counter_id, request_id, date1, date2, status) VALUES (?, ?, ?, ?, ?)`,
-		r.CounterID, r.RequestID, r.Date1, r.Date2, r.Status,
-	)
+// SetLastHourChecked records the most recent hour already judged, so a restart
+// neither re-alerts on it nor skips the hours in between.
+func (db *DB) SetLastHourChecked(ctx context.Context, counterID int64, hour time.Time) error {
+	_, err := db.ExecContext(ctx, `UPDATE counters SET last_hour_checked = ? WHERE id = ?`, hour, counterID)
 	if err != nil {
-		return fmt.Errorf("create log request: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	r.ID = id
-	return nil
-}
-
-// PendingLogRequest returns the export a counter is currently waiting on, or
-// nil when there is none. Only one is in flight at a time: exports are ordered
-// for consecutive windows, and running several would reorder the event stream.
-func (db *DB) PendingLogRequest(ctx context.Context, counterID int64) (*LogRequest, error) {
-	var r LogRequest
-	err := db.QueryRowContext(ctx,
-		`SELECT id, counter_id, request_id, date1, date2, status, created_at, updated_at
-		 FROM log_requests WHERE counter_id = ? ORDER BY id DESC LIMIT 1`, counterID,
-	).Scan(&r.ID, &r.CounterID, &r.RequestID, &r.Date1, &r.Date2, &r.Status, &r.CreatedAt, &r.UpdatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get pending log request: %w", err)
-	}
-	return &r, nil
-}
-
-// UpdateLogRequestStatus records the state Metrika last reported.
-func (db *DB) UpdateLogRequestStatus(ctx context.Context, id int64, status string) error {
-	_, err := db.ExecContext(ctx,
-		`UPDATE log_requests SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, status, id)
-	if err != nil {
-		return fmt.Errorf("update log request status: %w", err)
-	}
-	return nil
-}
-
-// DeleteLogRequest drops a finished export from tracking.
-func (db *DB) DeleteLogRequest(ctx context.Context, id int64) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM log_requests WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete log request: %w", err)
-	}
-	return nil
-}
-
-// StaleLogRequests lists exports last touched before cutoff, across all
-// counters. A process killed mid-flight leaves its request behind, and Metrika
-// caps how many a counter may hold — these are the ones to cancel.
-func (db *DB) StaleLogRequests(ctx context.Context, cutoff time.Time) ([]LogRequest, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, counter_id, request_id, date1, date2, status, created_at, updated_at
-		 FROM log_requests WHERE updated_at < ? ORDER BY id`, cutoff)
-	if err != nil {
-		return nil, fmt.Errorf("list stale log requests: %w", err)
-	}
-	defer rows.Close()
-
-	var out []LogRequest
-	for rows.Next() {
-		var r LogRequest
-		if err := rows.Scan(&r.ID, &r.CounterID, &r.RequestID, &r.Date1, &r.Date2, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// ---- Watermark ----
-
-// SetCounterWatermark records the newest event time already evaluated.
-func (db *DB) SetCounterWatermark(ctx context.Context, counterID int64, t time.Time) error {
-	_, err := db.ExecContext(ctx, `UPDATE counters SET last_event_at = ? WHERE id = ?`, t, counterID)
-	if err != nil {
-		return fmt.Errorf("set watermark: %w", err)
+		return fmt.Errorf("set last checked hour: %w", err)
 	}
 	return nil
 }

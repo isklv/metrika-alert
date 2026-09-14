@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/isklv/metrika-alert/internal/model"
 )
@@ -170,4 +171,165 @@ func (c *ReportClient) Goals(ctx context.Context) ([]Goal, error) {
 		return nil, fmt.Errorf("list goals: %w", err)
 	}
 	return resp.Goals, nil
+}
+
+// ---- Time series ----
+
+// The alerting engine works on hourly series: a counter's traffic has a strong
+// daily and weekly rhythm, so "now versus the same hour last Tuesday" is the
+// only comparison that distinguishes a real drop from the normal evening lull.
+const byTimePath = "/stat/v1/data/bytime"
+
+// GroupHour is the time grouping the alerting engine requests.
+const GroupHour = "hour"
+
+// TimeSeries is a metric-by-interval result from the bytime endpoint.
+//
+// Values is indexed [metric][interval], matching the request's metric order and
+// the Intervals slice, so a caller reads one metric's history as Values[i].
+type TimeSeries struct {
+	Intervals []time.Time
+	Values    [][]float64
+	Sampled   bool
+}
+
+// At returns one metric's value for one interval.
+func (s *TimeSeries) At(metric, interval int) (float64, bool) {
+	if metric < 0 || metric >= len(s.Values) {
+		return 0, false
+	}
+	if interval < 0 || interval >= len(s.Values[metric]) {
+		return 0, false
+	}
+	return s.Values[metric][interval], true
+}
+
+// IndexOf returns the position of the interval starting at t.
+func (s *TimeSeries) IndexOf(t time.Time) int {
+	for i, iv := range s.Intervals {
+		if iv.Equal(t) {
+			return i
+		}
+	}
+	return -1
+}
+
+// byTimeResponse mirrors the endpoint's payload. Unlike the table endpoint,
+// bytime nests metrics one level deeper: each metric carries a slice of
+// per-interval values rather than a single number.
+type byTimeResponse struct {
+	Totals        [][]float64 `json:"totals"`
+	TimeIntervals [][]string  `json:"time_intervals"`
+	Sampled       bool        `json:"sampled"`
+	Data          []struct {
+		Metrics [][]float64 `json:"metrics"`
+	} `json:"data"`
+}
+
+// FetchByTime requests an hourly series for the given metrics and period.
+//
+// date1/date2 accept the API's own formats, so a caller can pass either
+// YYYY-MM-DD or a relative keyword.
+func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1, date2 string) (*TimeSeries, error) {
+	if len(metrics) == 0 {
+		return nil, fmt.Errorf("time series needs at least one metric")
+	}
+	if len(metrics) > 20 {
+		return nil, fmt.Errorf("time series has %d metrics, the API allows 20", len(metrics))
+	}
+
+	q := Query{Metrics: metrics, Date1: date1, Date2: date2}
+	params := q.params(c.counterID)
+	params.Set("group", GroupHour)
+
+	var resp byTimeResponse
+	if err := c.tr.doJSON(ctx, http.MethodGet, byTimePath, params, &resp); err != nil {
+		return nil, fmt.Errorf("fetch time series: %w", err)
+	}
+
+	series := &TimeSeries{Sampled: resp.Sampled}
+
+	// Prefer totals: with no dimensions requested it carries the whole series,
+	// and it is present whether or not the period produced grouped rows.
+	series.Values = resp.Totals
+	if len(series.Values) == 0 && len(resp.Data) > 0 {
+		series.Values = resp.Data[0].Metrics
+	}
+
+	series.Intervals = parseTimeIntervals(resp.TimeIntervals)
+	if len(series.Intervals) == 0 {
+		// The field is not in the published schema, so the intervals are
+		// reconstructed from the request when the API omits them. Hourly
+		// grouping makes that unambiguous.
+		series.Intervals = deriveHourlyIntervals(date1, date2, seriesLength(series.Values))
+	}
+	return series, nil
+}
+
+// seriesLength reports the longest metric series in the response.
+func seriesLength(values [][]float64) int {
+	longest := 0
+	for _, v := range values {
+		if len(v) > longest {
+			longest = len(v)
+		}
+	}
+	return longest
+}
+
+// intervalLayouts are the forms a time_intervals boundary is observed in.
+var intervalLayouts = []string{
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02",
+}
+
+// parseTimeIntervals reads the start of each interval. Values are in the
+// counter's own time zone and carry no offset, so they are read as local time —
+// the same zone the engine buckets hours and weekdays in.
+func parseTimeIntervals(raw [][]string) []time.Time {
+	out := make([]time.Time, 0, len(raw))
+	for _, pair := range raw {
+		if len(pair) == 0 {
+			continue
+		}
+		t, ok := parseInterval(pair[0])
+		if !ok {
+			return nil
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func parseInterval(s string) (time.Time, bool) {
+	for _, layout := range intervalLayouts {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// deriveHourlyIntervals reconstructs interval starts for a period the caller
+// expressed as concrete dates. Relative keywords cannot be reconstructed, so
+// they yield nothing and the caller must rely on the API's own intervals.
+func deriveHourlyIntervals(date1, date2 string, count int) []time.Time {
+	if count == 0 {
+		return nil
+	}
+	start, err := time.ParseInLocation("2006-01-02", date1, time.Local)
+	if err != nil {
+		return nil
+	}
+	if _, err := time.ParseInLocation("2006-01-02", date2, time.Local); err != nil {
+		return nil
+	}
+
+	out := make([]time.Time, count)
+	for i := range out {
+		out[i] = start.Add(time.Duration(i) * time.Hour)
+	}
+	return out
 }

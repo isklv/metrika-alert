@@ -28,23 +28,18 @@ vkteams:
 # --- Yandex.Metrika -----------------------------------------------------------
 # OAuth tokens are stored per counter in the database, not here.
 metrika:
-  # One host serves both APIs this service uses: the Reporting API
-  # (/stat/v1/data) for reports and the Logs API (/management/v1/...) for raw
-  # events. Note the .net domain — api-metrika.yandex.ru does not serve the API.
+  # The Reporting API host. Note the .net domain — api-metrika.yandex.ru does
+  # not serve the API.
   base_url: https://api-metrika.yandex.net
 
-  # How far behind now a Logs API export window ends.
-  #
-  # This is a property of the API, not a tuning preference: Metrika refuses a
-  # window ending on the current day, and recent data keeps settling for hours
-  # after that. Lowering this below ~26 makes exports fail or return partial
-  # data. It is also why event triggers alert on yesterday, not on right now —
-  # see DEPLOY.md §6.
-  lag_hours: 26
+  # How long after an hour closes before it is judged. Metrika keeps counting
+  # sessions for a short while past the boundary, so judging an hour the moment
+  # it ends reads low and would fire false drops.
+  settle_minutes: 20
 
-  # Largest single export. A counter that fell behind is caught up one window
-  # per poll rather than in one request Metrika would refuse on quota.
-  max_window_hours: 24
+  # How many missed hours one check works through. After downtime the service
+  # catches up gradually instead of firing a burst of stale alerts at once.
+  max_catch_up_hours: 6
 
 # --- REST API (optional) ------------------------------------------------------
 api:
