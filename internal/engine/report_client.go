@@ -180,8 +180,13 @@ func (c *ReportClient) Goals(ctx context.Context) ([]Goal, error) {
 // only comparison that distinguishes a real drop from the normal evening lull.
 const byTimePath = "/stat/v1/data/bytime"
 
-// GroupHour is the time grouping the alerting engine requests.
-const GroupHour = "hour"
+// Time groupings this service requests. Both are plain values with no
+// documented point cap; the "minutes"/"hours" modes do carry one, which is why
+// they are avoided.
+const (
+	GroupHour       = "hour"
+	GroupTenMinutes = "dekaminute"
+)
 
 // TimeSeries is a metric-by-interval result from the bytime endpoint.
 //
@@ -191,6 +196,11 @@ type TimeSeries struct {
 	Intervals []time.Time
 	Values    [][]float64
 	Sampled   bool
+
+	// index maps an interval start to its position. Built on first lookup:
+	// a four-week series holds thousands of intervals and the evaluator
+	// addresses it once per window it judges.
+	index map[int64]int
 }
 
 // At returns one metric's value for one interval.
@@ -204,14 +214,28 @@ func (s *TimeSeries) At(metric, interval int) (float64, bool) {
 	return s.Values[metric][interval], true
 }
 
-// IndexOf returns the position of the interval starting at t.
+// IndexOf returns the position of the interval starting at t, or -1.
 func (s *TimeSeries) IndexOf(t time.Time) int {
-	for i, iv := range s.Intervals {
-		if iv.Equal(t) {
-			return i
+	if s.index == nil {
+		s.index = make(map[int64]int, len(s.Intervals))
+		for i, iv := range s.Intervals {
+			s.index[iv.Unix()] = i
 		}
 	}
+	if i, ok := s.index[t.Unix()]; ok {
+		return i
+	}
 	return -1
+}
+
+// Step reports the spacing between intervals, or 0 when the series is too short
+// to tell. The API may coarsen a grouping it considers too fine for the range,
+// and a series read at the wrong resolution would silently produce nonsense.
+func (s *TimeSeries) Step() time.Duration {
+	if len(s.Intervals) < 2 {
+		return 0
+	}
+	return s.Intervals[1].Sub(s.Intervals[0])
 }
 
 // byTimeResponse mirrors the endpoint's payload. Unlike the table endpoint,
@@ -226,11 +250,11 @@ type byTimeResponse struct {
 	} `json:"data"`
 }
 
-// FetchByTime requests an hourly series for the given metrics and period.
+// FetchByTime requests a time series at the given grouping.
 //
 // date1/date2 accept the API's own formats, so a caller can pass either
 // YYYY-MM-DD or a relative keyword.
-func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1, date2 string) (*TimeSeries, error) {
+func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1, date2, group string) (*TimeSeries, error) {
 	if len(metrics) == 0 {
 		return nil, fmt.Errorf("time series needs at least one metric")
 	}
@@ -240,7 +264,10 @@ func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1,
 
 	q := Query{Metrics: metrics, Date1: date1, Date2: date2}
 	params := q.params(c.counterID)
-	params.Set("group", GroupHour)
+	if group == "" {
+		group = GroupHour
+	}
+	params.Set("group", group)
 
 	var resp byTimeResponse
 	if err := c.tr.doJSON(ctx, http.MethodGet, byTimePath, params, &resp); err != nil {
@@ -259,11 +286,18 @@ func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1,
 	series.Intervals = parseTimeIntervals(resp.TimeIntervals)
 	if len(series.Intervals) == 0 {
 		// The field is not in the published schema, so the intervals are
-		// reconstructed from the request when the API omits them. Hourly
-		// grouping makes that unambiguous.
-		series.Intervals = deriveHourlyIntervals(date1, date2, seriesLength(series.Values))
+		// reconstructed from the request when the API omits them.
+		series.Intervals = deriveIntervals(date1, date2, groupStep(group), seriesLength(series.Values))
 	}
 	return series, nil
+}
+
+// groupStep is the interval width a grouping produces.
+func groupStep(group string) time.Duration {
+	if group == GroupTenMinutes {
+		return 10 * time.Minute
+	}
+	return time.Hour
 }
 
 // seriesLength reports the longest metric series in the response.
@@ -312,10 +346,10 @@ func parseInterval(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// deriveHourlyIntervals reconstructs interval starts for a period the caller
+// deriveIntervals reconstructs interval starts for a period the caller
 // expressed as concrete dates. Relative keywords cannot be reconstructed, so
 // they yield nothing and the caller must rely on the API's own intervals.
-func deriveHourlyIntervals(date1, date2 string, count int) []time.Time {
+func deriveIntervals(date1, date2 string, step time.Duration, count int) []time.Time {
 	if count == 0 {
 		return nil
 	}
@@ -329,7 +363,7 @@ func deriveHourlyIntervals(date1, date2 string, count int) []time.Time {
 
 	out := make([]time.Time, count)
 	for i := range out {
-		out[i] = start.Add(time.Duration(i) * time.Hour)
+		out[i] = start.Add(time.Duration(i) * step)
 	}
 	return out
 }

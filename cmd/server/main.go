@@ -88,7 +88,9 @@ func main() {
 	metrikaCfg := &engine.MetrikaConfig{
 		BaseURL:         cfg.Metrika.BaseURL,
 		SettleMinutes:   cfg.Metrika.SettleMinutes,
-		MaxCatchUpHours: cfg.Metrika.MaxCatchUpHours,
+		WindowMinutes:   cfg.Metrika.WindowMinutes,
+		StepMinutes:     cfg.Metrika.StepMinutes,
+		MaxCatchUpSteps: cfg.Metrika.MaxCatchUpSteps,
 	}
 	evaluator := engine.NewEvaluator(db, router, metrikaCfg)
 	poller := engine.NewPoller(db, metrikaCfg, evaluator)

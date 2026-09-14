@@ -10,10 +10,12 @@ import (
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
-// Poller walks each counter forward through completed hours.
+// Poller walks each counter forward through measurement windows.
 //
-// Only whole hours are judged: the hour in progress is still filling, and
-// comparing a partial hour against complete ones would report a drop every time.
+// The window is an hour wide but advances in ten-minute steps, so a drop is
+// noticed within minutes instead of at the end of the hour, while the figure
+// compared stays at hourly scale. Only settled data is judged: a window whose
+// tail is still filling would read low against complete ones every time.
 type Poller struct {
 	db        *model.DB
 	cfg       *MetrikaConfig
@@ -27,19 +29,27 @@ type Poller struct {
 type MetrikaConfig struct {
 	// BaseURL is the API host, https://api-metrika.yandex.net by default.
 	BaseURL string
-	// SettleMinutes is how long after an hour ends before it is judged. Metrika
-	// keeps counting sessions for a short while after the boundary, so judging
-	// an hour the moment it closes reads low.
+	// SettleMinutes is how long data is left to settle before it is judged.
+	// Metrika keeps counting sessions for a short while after they happen, so
+	// measuring right up to the present reads low.
 	SettleMinutes int
-	// MaxCatchUpHours bounds how many missed hours one tick works through, so a
-	// counter idle for a week does not fire a burst of stale alerts at once.
-	MaxCatchUpHours int
+	// WindowMinutes is how much traffic one measurement covers. An hour keeps
+	// the figure stable; the window still advances every StepMinutes.
+	WindowMinutes int
+	// StepMinutes is how far the window advances per check, and the granularity
+	// requested from the API.
+	StepMinutes int
+	// MaxCatchUpSteps bounds how many missed windows one tick works through, so
+	// a counter idle for a week does not fire a burst of stale alerts at once.
+	MaxCatchUpSteps int
 }
 
 // Defaults for MetrikaConfig.
 const (
 	DefaultSettleMinutes   = 20
-	DefaultMaxCatchUpHours = 6
+	DefaultWindowMinutes   = 60
+	DefaultStepMinutes     = 10
+	DefaultMaxCatchUpSteps = 6
 )
 
 func (c *MetrikaConfig) settle() time.Duration {
@@ -49,11 +59,27 @@ func (c *MetrikaConfig) settle() time.Duration {
 	return time.Duration(c.SettleMinutes) * time.Minute
 }
 
-func (c *MetrikaConfig) maxCatchUp() int {
-	if c.MaxCatchUpHours <= 0 {
-		return DefaultMaxCatchUpHours
+func (c *MetrikaConfig) window() time.Duration {
+	if c.WindowMinutes <= 0 {
+		return DefaultWindowMinutes * time.Minute
 	}
-	return c.MaxCatchUpHours
+	return time.Duration(c.WindowMinutes) * time.Minute
+}
+
+// step is both the cadence and the API granularity, so the two can never drift
+// apart into windows that do not line up with the buckets they are summed from.
+func (c *MetrikaConfig) step() time.Duration {
+	if c.StepMinutes <= 0 {
+		return DefaultStepMinutes * time.Minute
+	}
+	return time.Duration(c.StepMinutes) * time.Minute
+}
+
+func (c *MetrikaConfig) maxCatchUp() int {
+	if c.MaxCatchUpSteps <= 0 {
+		return DefaultMaxCatchUpSteps
+	}
+	return c.MaxCatchUpSteps
 }
 
 func NewPoller(db *model.DB, cfg *MetrikaConfig, evaluator *Evaluator) *Poller {
@@ -82,8 +108,8 @@ func (p *Poller) Start(ctx context.Context) error {
 	for _, c := range counters {
 		go p.pollCounterLoop(ctx, c)
 	}
-	log.Printf("poller started: %d counter(s), hours judged %s after they close",
-		len(counters), p.cfg.settle())
+	log.Printf("poller started: %d counter(s), %s window stepped every %s, %s to settle",
+		len(counters), p.cfg.window(), p.cfg.step(), p.cfg.settle())
 	return nil
 }
 
@@ -108,7 +134,7 @@ func (p *Poller) pollCounterLoop(ctx context.Context, c model.Counter) {
 	}
 }
 
-// advance judges every hour a counter has not seen yet.
+// advance judges every window a counter has not seen yet.
 func (p *Poller) advance(ctx context.Context, counterID int64) error {
 	// Re-read the counter each tick: its cursor moves, and its token or
 	// interval may have been changed through the bot or the API.
@@ -117,52 +143,65 @@ func (p *Poller) advance(ctx context.Context, counterID int64) error {
 		return err
 	}
 
-	hours := p.pendingHours(counter, time.Now())
-	if len(hours) == 0 {
+	windows := p.pendingWindows(counter, time.Now())
+	if len(windows) == 0 {
 		return nil
 	}
 
-	for _, hour := range hours {
-		fired, err := p.evaluator.EvaluateHour(ctx, counter, hour)
+	for _, end := range windows {
+		fired, err := p.evaluator.EvaluateWindow(ctx, counter, end)
 		if err != nil {
-			// Leave the cursor where it is so the hour is retried rather than
+			// Leave the cursor where it is so the window is retried rather than
 			// silently skipped.
-			return fmt.Errorf("judge hour %s: %w", hour.Format("2006-01-02 15:00"), err)
+			return fmt.Errorf("judge window ending %s: %w", end.Format("2006-01-02 15:04"), err)
 		}
-		if err := p.db.SetLastHourChecked(ctx, counter.ID, hour); err != nil {
+		if err := p.db.SetLastHourChecked(ctx, counter.ID, end); err != nil {
 			return err
 		}
 		if fired > 0 {
-			log.Printf("counter %s: hour %s fired %d alert(s)",
-				counter.CounterID, hour.Format("2006-01-02 15:00"), fired)
+			log.Printf("counter %s: window ending %s fired %d alert(s)",
+				counter.CounterID, end.Format("2006-01-02 15:04"), fired)
 		}
 	}
 	return nil
 }
 
-// pendingHours lists the completed hours a counter still owes, oldest first.
-func (p *Poller) pendingHours(counter *model.Counter, now time.Time) []time.Time {
-	// The newest hour that has both closed and settled.
-	//
-	// The hour starting at H only closes at H+1h, so subtracting the settle
-	// delay alone would hand back the hour still in progress — and a partial
-	// hour measured against complete ones reads as a drop every single time.
-	latest := now.Add(-time.Hour - p.cfg.settle()).Truncate(time.Hour)
+// pendingWindows lists the window ends a counter still owes, oldest first.
+func (p *Poller) pendingWindows(counter *model.Counter, now time.Time) []time.Time {
+	step := p.cfg.step()
 
-	// A counter with no cursor starts at the previous hour rather than replaying
-	// history: those hours are long past and alerting on them helps nobody.
+	// The newest window end whose data has settled. Everything up to this point
+	// is counted; measuring closer to the present reads low.
+	latest := truncateTo(now.Add(-p.cfg.settle()), step)
+
+	// A counter with no cursor starts at the latest window rather than replaying
+	// history: those windows are past and alerting on them helps nobody.
 	if counter.LastHourChecked == nil {
 		return []time.Time{latest}
 	}
 
-	var hours []time.Time
-	for h := counter.LastHourChecked.Truncate(time.Hour).Add(time.Hour); !h.After(latest); h = h.Add(time.Hour) {
-		hours = append(hours, h)
-		if len(hours) >= p.cfg.maxCatchUp() {
+	var windows []time.Time
+	for end := truncateTo(*counter.LastHourChecked, step).Add(step); !end.After(latest); end = end.Add(step) {
+		windows = append(windows, end)
+		if len(windows) >= p.cfg.maxCatchUp() {
 			break
 		}
 	}
-	return hours
+	return windows
+}
+
+// truncateTo rounds t down to a multiple of step within the day. time.Truncate
+// works on absolute time, which drifts against local wall-clock slots when the
+// zone offset is not a whole number of hours.
+func truncateTo(t time.Time, step time.Duration) time.Time {
+	minutes := t.Hour()*60 + t.Minute()
+	stepMinutes := int(step / time.Minute)
+	if stepMinutes <= 0 {
+		stepMinutes = 1
+	}
+	aligned := minutes - minutes%stepMinutes
+
+	return time.Date(t.Year(), t.Month(), t.Day(), aligned/60, aligned%60, 0, 0, t.Location())
 }
 
 // RunOnce advances every counter a single step. Used by /poll and the REST API.

@@ -6,32 +6,42 @@ import (
 	"time"
 )
 
-// hourlySeries builds a series starting at `start` with one value per hour.
-func hourlySeries(start time.Time, values []float64) *TimeSeries {
+// testStep is the bucket width every fixture here uses.
+const testStep = 10 * time.Minute
+
+// steppedSeries builds a series starting at `start` with one value per bucket.
+func steppedSeries(start time.Time, values []float64) *TimeSeries {
 	intervals := make([]time.Time, len(values))
 	for i := range values {
-		intervals[i] = start.Add(time.Duration(i) * time.Hour)
+		intervals[i] = start.Add(time.Duration(i) * testStep)
 	}
 	return &TimeSeries{Intervals: intervals, Values: [][]float64{values}}
 }
 
-// weeklySeries builds four weeks of hourly data where every hour of every day
-// carries `base`, then applies overrides at specific times.
+// weeklySeries builds `weeks` of ten-minute data where every bucket carries
+// `base`, then applies overrides at specific bucket starts.
 func weeklySeries(t *testing.T, end time.Time, weeks int, base float64, overrides map[time.Time]float64) *TimeSeries {
 	t.Helper()
-	start := end.AddDate(0, 0, -7*weeks)
-	hours := int(end.Sub(start).Hours()) + 1
+	start := end.AddDate(0, 0, -7*weeks).Add(-time.Hour)
+	count := int(end.Sub(start)/testStep) + 1
 
-	intervals := make([]time.Time, hours)
-	values := make([]float64, hours)
+	intervals := make([]time.Time, count)
+	values := make([]float64, count)
 	for i := range intervals {
-		intervals[i] = start.Add(time.Duration(i) * time.Hour)
+		intervals[i] = start.Add(time.Duration(i) * testStep)
 		values[i] = base
 		if v, ok := overrides[intervals[i]]; ok {
 			values[i] = v
 		}
 	}
 	return &TimeSeries{Intervals: intervals, Values: [][]float64{values}}
+}
+
+// fillWindow marks every bucket of the hour ending at `end` with value v.
+func fillWindow(overrides map[time.Time]float64, end time.Time, v float64) {
+	for at := end.Add(-time.Hour); at.Before(end); at = at.Add(testStep) {
+		overrides[at] = v
+	}
 }
 
 func TestResolveMetric(t *testing.T) {
@@ -64,67 +74,105 @@ func TestResolveMetric(t *testing.T) {
 	}
 }
 
-// The core of the design: an hour is compared with the same hour on the same
-// weekday, never with the hours around it.
-func TestBaselineUsesSameHourSameWeekday(t *testing.T) {
-	// Tuesday 15:00.
-	now := time.Date(2026, 9, 8, 15, 0, 0, 0, time.Local)
-	if now.Weekday() != time.Tuesday {
-		t.Fatalf("fixture is %s, expected Tuesday", now.Weekday())
+// The core of the design: a window is compared with the same window on the same
+// weekday, never with the traffic around it.
+func TestBaselineUsesSameTimeSameWeekday(t *testing.T) {
+	// Tuesday, window ending 15:20.
+	end := time.Date(2026, 9, 8, 15, 20, 0, 0, time.Local)
+	if end.Weekday() != time.Tuesday {
+		t.Fatalf("fixture is %s, expected Tuesday", end.Weekday())
 	}
 
-	overrides := map[time.Time]float64{
-		now.AddDate(0, 0, -7):  100, // last Tuesday 15:00
-		now.AddDate(0, 0, -14): 120, // two Tuesdays ago
-		now.AddDate(0, 0, -21): 110, // three Tuesdays ago
-		// Noise that must NOT enter the baseline:
-		now.Add(-time.Hour):                  9000, // same day, an hour earlier
-		now.AddDate(0, 0, -1):                9000, // Monday 15:00
-		now.AddDate(0, 0, -7).Add(time.Hour): 9000, // last Tuesday 16:00
-	}
-	series := weeklySeries(t, now, 4, 50, overrides)
+	overrides := map[time.Time]float64{}
+	// Six buckets of 10 make a window of 60 on past Tuesdays.
+	fillWindow(overrides, end.AddDate(0, 0, -7), 10)
+	fillWindow(overrides, end.AddDate(0, 0, -14), 20)
+	fillWindow(overrides, end.AddDate(0, 0, -21), 15)
+	// Noise that must NOT enter the baseline:
+	fillWindow(overrides, end.AddDate(0, 0, -1), 900)                  // Monday, same time
+	fillWindow(overrides, end.AddDate(0, 0, -7).Add(2*time.Hour), 900) // last Tuesday, later
 
-	baseline := BuildBaseline(series, 0, now)
+	series := weeklySeries(t, end, 3, 1, overrides)
 
-	// Four Tuesdays at 15:00 sit in the window: 100, 120, 110 and the untouched
-	// 50 from four weeks back. Median of those is 105.
-	if baseline.Samples != 4 {
-		t.Fatalf("samples = %d, want the 4 earlier Tuesdays at 15:00", baseline.Samples)
+	baseline := BuildBaseline(series, 0, end, time.Hour, 3)
+
+	if baseline.Samples != 3 {
+		t.Fatalf("samples = %d, want the 3 earlier Tuesdays", baseline.Samples)
 	}
-	if math.Abs(baseline.Value-105) > 0.01 {
-		t.Errorf("baseline = %v, want 105 — a neighbouring hour or weekday leaked in", baseline.Value)
+	// Windows of 60, 120 and 90; median 90.
+	if math.Abs(baseline.Value-90) > 0.01 {
+		t.Errorf("baseline = %v, want 90 — a neighbouring time or weekday leaked in", baseline.Value)
 	}
 }
 
-// The hour being judged must not be part of the baseline it is judged against,
-// or a drop would drag its own expectation down with it.
-func TestBaselineExcludesTheHourUnderTest(t *testing.T) {
-	now := time.Date(2026, 9, 8, 15, 0, 0, 0, time.Local)
-	series := weeklySeries(t, now, 2, 100, map[time.Time]float64{now: 0})
+// The window being judged must not be part of the baseline it is judged
+// against, or a drop would drag its own expectation down with it.
+func TestBaselineExcludesTheWindowUnderTest(t *testing.T) {
+	end := time.Date(2026, 9, 8, 15, 20, 0, 0, time.Local)
 
-	baseline := BuildBaseline(series, 0, now)
+	overrides := map[time.Time]float64{}
+	fillWindow(overrides, end, 0) // the collapse being judged
 
-	if baseline.Value != 100 {
-		t.Errorf("baseline = %v, want 100 — the collapsed hour polluted its own baseline", baseline.Value)
+	series := weeklySeries(t, end, 2, 100, overrides)
+
+	baseline := BuildBaseline(series, 0, end, time.Hour, 2)
+
+	// Six untouched buckets of 100 per past window.
+	if math.Abs(baseline.Value-600) > 0.01 {
+		t.Errorf("baseline = %v, want 600 — the collapsed window polluted its own baseline", baseline.Value)
 	}
 }
 
 // One outlier week must not move the expectation much; that is why the median
 // is used instead of the mean.
 func TestBaselineMedianResistsOutliers(t *testing.T) {
-	now := time.Date(2026, 9, 8, 15, 0, 0, 0, time.Local)
-	overrides := map[time.Time]float64{
-		now.AddDate(0, 0, -7):  100,
-		now.AddDate(0, 0, -14): 100,
-		now.AddDate(0, 0, -21): 100,
-		now.AddDate(0, 0, -28): 10000, // a newsletter blast four weeks ago
-	}
-	series := weeklySeries(t, now, 5, 100, overrides)
+	end := time.Date(2026, 9, 8, 15, 20, 0, 0, time.Local)
 
-	baseline := BuildBaseline(series, 0, now)
+	overrides := map[time.Time]float64{}
+	fillWindow(overrides, end.AddDate(0, 0, -7), 100)
+	fillWindow(overrides, end.AddDate(0, 0, -14), 100)
+	fillWindow(overrides, end.AddDate(0, 0, -21), 100)
+	fillWindow(overrides, end.AddDate(0, 0, -28), 10000) // a newsletter blast
 
-	if baseline.Value > 200 {
+	series := weeklySeries(t, end, 4, 100, overrides)
+
+	baseline := BuildBaseline(series, 0, end, time.Hour, 4)
+
+	if baseline.Value > 1200 {
 		t.Errorf("baseline = %v — one spike dragged the expectation up, a real drop would now go unnoticed", baseline.Value)
+	}
+}
+
+// An hour of signal is summed from six ten-minute buckets, so the figure stays
+// at hourly scale while the window advances every ten minutes.
+func TestWindowSumCoversTheWholeWindow(t *testing.T) {
+	start := time.Date(2026, 9, 8, 14, 0, 0, 0, time.Local)
+	// Twelve buckets: two hours of 5 each.
+	series := steppedSeries(start, []float64{5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5})
+
+	got, ok := WindowSum(series, 0, start.Add(time.Hour), time.Hour)
+	if !ok {
+		t.Fatal("window not covered")
+	}
+	if got != 30 {
+		t.Errorf("WindowSum = %v, want 30 (six buckets of 5)", got)
+	}
+
+	// Stepping forward by one bucket keeps the width at an hour.
+	got, ok = WindowSum(series, 0, start.Add(70*time.Minute), time.Hour)
+	if !ok || got != 30 {
+		t.Errorf("stepped WindowSum = %v, %v, want 30", got, ok)
+	}
+}
+
+// A window reaching past the series must be reported as uncovered rather than
+// silently summing whatever part of it exists.
+func TestWindowSumRejectsIncompleteCoverage(t *testing.T) {
+	start := time.Date(2026, 9, 8, 14, 0, 0, 0, time.Local)
+	series := steppedSeries(start, []float64{5, 5, 5})
+
+	if _, ok := WindowSum(series, 0, start.Add(time.Hour), time.Hour); ok {
+		t.Error("summed a window the series does not fully cover")
 	}
 }
 
@@ -231,12 +279,12 @@ func TestValidDirection(t *testing.T) {
 
 func TestTimeSeriesLookup(t *testing.T) {
 	start := time.Date(2026, 9, 8, 0, 0, 0, 0, time.Local)
-	s := hourlySeries(start, []float64{10, 20, 30})
+	s := steppedSeries(start, []float64{10, 20, 30})
 
-	if i := s.IndexOf(start.Add(2 * time.Hour)); i != 2 {
+	if i := s.IndexOf(start.Add(2 * testStep)); i != 2 {
 		t.Errorf("IndexOf = %d, want 2", i)
 	}
-	if i := s.IndexOf(start.Add(99 * time.Hour)); i != -1 {
+	if i := s.IndexOf(start.Add(99 * testStep)); i != -1 {
 		t.Errorf("IndexOf for an absent hour = %d, want -1", i)
 	}
 	if v, ok := s.At(0, 1); !ok || v != 20 {
@@ -286,5 +334,24 @@ func TestChangeVerbAgreesWithMetric(t *testing.T) {
 		if got := changeVerb(tc.metric, tc.deviationPct); got != tc.want {
 			t.Errorf("changeVerb(%q, %v) = %q, want %q", tc.metric, tc.deviationPct, got, tc.want)
 		}
+	}
+}
+
+// A series returned at a coarser grouping than asked for must be detectable,
+// or windows would be summed from the wrong spans.
+func TestTimeSeriesStep(t *testing.T) {
+	start := time.Date(2026, 9, 8, 0, 0, 0, 0, time.Local)
+
+	if got := steppedSeries(start, []float64{1, 2, 3}).Step(); got != testStep {
+		t.Errorf("Step = %s, want %s", got, testStep)
+	}
+	// Too short to tell.
+	if got := steppedSeries(start, []float64{1}).Step(); got != 0 {
+		t.Errorf("Step on a single interval = %s, want 0", got)
+	}
+
+	hourly := &TimeSeries{Intervals: []time.Time{start, start.Add(time.Hour)}}
+	if got := hourly.Step(); got != time.Hour {
+		t.Errorf("Step = %s, want 1h", got)
 	}
 }

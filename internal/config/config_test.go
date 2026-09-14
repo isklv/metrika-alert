@@ -180,9 +180,11 @@ func TestDefaultMetrikaHostIsTheDocumentedOne(t *testing.T) {
 	}
 }
 
-func TestHourlyPacingOverrides(t *testing.T) {
+func TestMeasurementPacingOverrides(t *testing.T) {
 	t.Setenv("METRIKA_SETTLE_MINUTES", "45")
-	t.Setenv("METRIKA_MAX_CATCH_UP_HOURS", "3")
+	t.Setenv("METRIKA_WINDOW_MINUTES", "120")
+	t.Setenv("METRIKA_STEP_MINUTES", "30")
+	t.Setenv("METRIKA_MAX_CATCH_UP_STEPS", "3")
 
 	cfg, err := Load(writeConfig(t, "metrika:\n  settle_minutes: 15\n"))
 	if err != nil {
@@ -191,7 +193,28 @@ func TestHourlyPacingOverrides(t *testing.T) {
 	if cfg.Metrika.SettleMinutes != 45 {
 		t.Errorf("settle_minutes = %d, want the env override", cfg.Metrika.SettleMinutes)
 	}
-	if cfg.Metrika.MaxCatchUpHours != 3 {
-		t.Errorf("max_catch_up_hours = %d", cfg.Metrika.MaxCatchUpHours)
+	if cfg.Metrika.WindowMinutes != 120 || cfg.Metrika.StepMinutes != 30 {
+		t.Errorf("window/step = %d/%d", cfg.Metrika.WindowMinutes, cfg.Metrika.StepMinutes)
+	}
+	if cfg.Metrika.MaxCatchUpSteps != 3 {
+		t.Errorf("max_catch_up_steps = %d", cfg.Metrika.MaxCatchUpSteps)
+	}
+}
+
+// The defaults are an hour of signal advancing every ten minutes.
+func TestMeasurementDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "database: x.db\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Metrika.WindowMinutes != 60 {
+		t.Errorf("window_minutes = %d, want 60", cfg.Metrika.WindowMinutes)
+	}
+	if cfg.Metrika.StepMinutes != 10 {
+		t.Errorf("step_minutes = %d, want 10", cfg.Metrika.StepMinutes)
+	}
+	// A window narrower than the step would leave gaps between measurements.
+	if cfg.Metrika.WindowMinutes < cfg.Metrika.StepMinutes {
+		t.Error("the window must be at least as wide as the step")
 	}
 }

@@ -27,85 +27,106 @@ func newPollerHarness(t *testing.T, fake *byTimeFake, cfg *MetrikaConfig) (*Poll
 	return NewPoller(db, cfg, evaluator), db, counter
 }
 
-// Only whole hours are judged: the hour in progress is still filling, and
-// comparing it against complete ones would report a drop every time.
-func TestPendingHoursSkipsTheHourInProgress(t *testing.T) {
-	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6}, nil)
+// Data is only judged once it has settled: Metrika keeps counting sessions for
+// a while after they happen, so measuring up to the present reads low.
+func TestPendingWindowsWaitsForDataToSettle(t *testing.T) {
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
 
-	// 14:35 — the 14:00 hour has not closed yet.
+	// 14:35 — with 20 minutes to settle, everything through 14:10 is countable.
 	now := time.Date(2026, 9, 8, 14, 35, 0, 0, time.Local)
-	hours := p.pendingHours(&model.Counter{}, now)
+	windows := p.pendingWindows(&model.Counter{}, now)
 
-	if len(hours) != 1 {
-		t.Fatalf("got %d hours, want 1", len(hours))
+	if len(windows) != 1 {
+		t.Fatalf("got %d windows, want 1", len(windows))
 	}
-	if hours[0].Hour() != 13 {
-		t.Errorf("judged hour %d:00, want 13:00 — the hour in progress was included", hours[0].Hour())
-	}
-}
-
-// Metrika keeps counting sessions past the boundary, so a freshly closed hour
-// must be left to settle before it is judged.
-func TestPendingHoursWaitsForTheHourToSettle(t *testing.T) {
-	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6}, nil)
-
-	// 15:05 — the 14:00 hour closed five minutes ago, inside the settle window.
-	now := time.Date(2026, 9, 8, 15, 5, 0, 0, time.Local)
-	hours := p.pendingHours(&model.Counter{}, now)
-
-	if hours[0].Hour() != 13 {
-		t.Errorf("judged %d:00 only five minutes after it closed", hours[0].Hour())
-	}
-
-	// 15:25 — now 14:00 has settled.
-	hours = p.pendingHours(&model.Counter{}, now.Add(20*time.Minute))
-	if hours[0].Hour() != 14 {
-		t.Errorf("judged %d:00, want 14:00 once the settle window passed", hours[0].Hour())
+	if got := windows[0]; got.Hour() != 14 || got.Minute() != 10 {
+		t.Errorf("window ends %s, want 14:10", got.Format("15:04"))
 	}
 }
 
-// A counter that has never been checked starts at the previous hour rather than
-// replaying history — those hours are long past and alerting on them helps nobody.
+// The whole point of the ten-minute step: a drop is noticed within minutes,
+// not at the end of the hour.
+func TestWindowAdvancesEveryStep(t *testing.T) {
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
+	now := time.Date(2026, 9, 8, 14, 35, 0, 0, time.Local)
+
+	previous := time.Date(2026, 9, 8, 14, 0, 0, 0, time.Local)
+	windows := p.pendingWindows(&model.Counter{LastHourChecked: &previous}, now)
+
+	if len(windows) != 1 {
+		t.Fatalf("got %d windows, want 1", len(windows))
+	}
+	if !windows[0].Equal(previous.Add(10 * time.Minute)) {
+		t.Errorf("next window ends %s, want one step on from %s",
+			windows[0].Format("15:04"), previous.Format("15:04"))
+	}
+
+	// Ten minutes later there is exactly one more window to judge.
+	windows = p.pendingWindows(&model.Counter{LastHourChecked: &previous}, now.Add(10*time.Minute))
+	if len(windows) != 2 {
+		t.Errorf("got %d windows after another step, want 2", len(windows))
+	}
+}
+
+// Window ends land on step boundaries so a slot means the same thing week to
+// week; an unaligned cursor must be pulled back onto the grid.
+func TestWindowEndsAlignToTheStepGrid(t *testing.T) {
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
+	now := time.Date(2026, 9, 8, 14, 37, 0, 0, time.Local)
+
+	for _, w := range p.pendingWindows(&model.Counter{}, now) {
+		if w.Minute()%10 != 0 || w.Second() != 0 {
+			t.Errorf("window end %s is off the ten-minute grid", w.Format("15:04:05"))
+		}
+	}
+
+	skewed := time.Date(2026, 9, 8, 13, 47, 0, 0, time.Local)
+	for _, w := range p.pendingWindows(&model.Counter{LastHourChecked: &skewed}, now) {
+		if w.Minute()%10 != 0 {
+			t.Errorf("window end %s is off the grid after a skewed cursor", w.Format("15:04"))
+		}
+	}
+}
+
+// A counter that has never been checked starts at the latest window rather than
+// replaying history — those windows are past and alerting on them helps nobody.
 func TestFreshCounterDoesNotReplayHistory(t *testing.T) {
-	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6}, nil)
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
 	now := time.Date(2026, 9, 8, 14, 35, 0, 0, time.Local)
 
-	hours := p.pendingHours(&model.Counter{LastHourChecked: nil}, now)
+	windows := p.pendingWindows(&model.Counter{LastHourChecked: nil}, now)
 
-	if len(hours) != 1 {
-		t.Errorf("a fresh counter queued %d hours, want 1", len(hours))
+	if len(windows) != 1 {
+		t.Errorf("a fresh counter queued %d windows, want 1", len(windows))
 	}
 }
 
-// After downtime the missed hours are worked through, but only so many at once.
+// After downtime the missed windows are worked through, but only so many at once.
 func TestCatchUpIsBounded(t *testing.T) {
-	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6}, nil)
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
 	now := time.Date(2026, 9, 8, 14, 35, 0, 0, time.Local)
 
 	lastChecked := now.AddDate(0, 0, -3)
-	hours := p.pendingHours(&model.Counter{LastHourChecked: &lastChecked}, now)
+	windows := p.pendingWindows(&model.Counter{LastHourChecked: &lastChecked}, now)
 
-	if len(hours) != 6 {
-		t.Fatalf("queued %d hours, want the 6-hour cap", len(hours))
+	if len(windows) != 6 {
+		t.Fatalf("queued %d windows, want the 6-step cap", len(windows))
 	}
 	// Oldest first, so the cursor advances without gaps.
-	for i := 1; i < len(hours); i++ {
-		if !hours[i].Equal(hours[i-1].Add(time.Hour)) {
-			t.Fatalf("hours are not consecutive: %v", hours)
+	for i := 1; i < len(windows); i++ {
+		if !windows[i].Equal(windows[i-1].Add(10 * time.Minute)) {
+			t.Fatalf("windows are not consecutive: %v", windows)
 		}
-	}
-	if !hours[0].Equal(lastChecked.Truncate(time.Hour).Add(time.Hour)) {
-		t.Errorf("catch-up starts at %s, want the hour after the cursor", hours[0])
 	}
 }
 
 func TestNothingPendingWhenUpToDate(t *testing.T) {
-	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6}, nil)
+	p := NewPoller(nil, &MetrikaConfig{SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}, nil)
 	now := time.Date(2026, 9, 8, 14, 35, 0, 0, time.Local)
 
-	current := now.Add(-p.cfg.settle()).Truncate(time.Hour)
-	if hours := p.pendingHours(&model.Counter{LastHourChecked: &current}, now); len(hours) != 0 {
-		t.Errorf("queued %d hours while already current", len(hours))
+	current := truncateTo(now.Add(-p.cfg.settle()), p.cfg.step())
+	if windows := p.pendingWindows(&model.Counter{LastHourChecked: &current}, now); len(windows) != 0 {
+		t.Errorf("queued %d windows while already current", len(windows))
 	}
 }
 
@@ -113,7 +134,7 @@ func TestNothingPendingWhenUpToDate(t *testing.T) {
 // already alerted on.
 func TestCursorAdvancesAndPersists(t *testing.T) {
 	fake := &byTimeFake{value: steadyExcept(100, nil)}
-	p, db, counter := newPollerHarness(t, fake, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6})
+	p, db, counter := newPollerHarness(t, fake, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpSteps: 6})
 	ctx := context.Background()
 
 	if err := db.CreateTrigger(ctx, &model.Trigger{
@@ -148,7 +169,7 @@ func TestCursorAdvancesAndPersists(t *testing.T) {
 // A failed hour must not advance the cursor, or it is silently skipped.
 func TestFailedHourIsRetried(t *testing.T) {
 	fake := &byTimeFake{value: steadyExcept(100, nil)}
-	p, db, counter := newPollerHarness(t, fake, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpHours: 6})
+	p, db, counter := newPollerHarness(t, fake, &MetrikaConfig{SettleMinutes: 20, MaxCatchUpSteps: 6})
 	ctx := context.Background()
 
 	// A rule whose metric cannot resolve makes the whole fetch fail.
@@ -174,8 +195,18 @@ func TestMetrikaConfigDefaults(t *testing.T) {
 	if cfg.settle() != DefaultSettleMinutes*time.Minute {
 		t.Errorf("settle = %s", cfg.settle())
 	}
-	if cfg.maxCatchUp() != DefaultMaxCatchUpHours {
+	if cfg.maxCatchUp() != DefaultMaxCatchUpSteps {
 		t.Errorf("maxCatchUp = %d", cfg.maxCatchUp())
+	}
+	if cfg.window() != DefaultWindowMinutes*time.Minute {
+		t.Errorf("window = %s", cfg.window())
+	}
+	if cfg.step() != DefaultStepMinutes*time.Minute {
+		t.Errorf("step = %s", cfg.step())
+	}
+	// A window narrower than the step would leave gaps between measurements.
+	if cfg.window() < cfg.step() {
+		t.Error("the window must be at least as wide as the step")
 	}
 }
 

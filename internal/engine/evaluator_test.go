@@ -16,7 +16,10 @@ import (
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
-// byTimeFake serves /stat/v1/data/bytime from a generated hourly history.
+// fakeStep is the bucket width the fake serves, matching the engine's default.
+const fakeStep = 10 * time.Minute
+
+// byTimeFake serves /stat/v1/data/bytime from a generated ten-minute history.
 type byTimeFake struct {
 	mu sync.Mutex
 	// value returns the figure for one metric at one hour.
@@ -40,8 +43,8 @@ func (f *byTimeFake) serve(t *testing.T) string {
 
 		date1, _ := time.ParseInLocation("2006-01-02", q.Get("date1"), time.Local)
 		date2, _ := time.ParseInLocation("2006-01-02", q.Get("date2"), time.Local)
-		// The API reports whole days, so the range ends at the last hour of date2.
-		end := date2.Add(23 * time.Hour)
+		// The API reports whole days, so the range ends at the last bucket of date2.
+		end := date2.Add(24*time.Hour - fakeStep)
 
 		metrics := strings.Split(q.Get("metrics"), ",")
 		var intervals [][]string
@@ -49,7 +52,7 @@ func (f *byTimeFake) serve(t *testing.T) string {
 		for range metrics {
 			totals = append(totals, nil)
 		}
-		for h := date1; !h.After(end); h = h.Add(time.Hour) {
+		for h := date1; !h.After(end); h = h.Add(fakeStep) {
 			intervals = append(intervals, []string{h.Format("2006-01-02 15:04:05")})
 			for i, m := range metrics {
 				totals[i] = append(totals[i], f.value(m, h))
@@ -114,15 +117,18 @@ func (h *evalHarness) addTrigger(t *testing.T, trigger *model.Trigger) *model.Tr
 	return trigger
 }
 
-// tuesday3pm is the hour under test in these cases.
+// tuesday3pm is the end of the window under test in these cases.
 var tuesday3pm = time.Date(2026, 9, 8, 15, 0, 0, 0, time.Local)
 
-// steadyExcept returns a value function that reports `normal` everywhere except
-// at the given hours.
-func steadyExcept(normal float64, overrides map[time.Time]float64) func(string, time.Time) float64 {
+// steadyExcept returns a per-bucket value function that reports `normal`
+// everywhere except inside the hour-wide windows named by `collapsed`, which
+// report that window's value spread across its buckets.
+func steadyExcept(normal float64, collapsed map[time.Time]float64) func(string, time.Time) float64 {
 	return func(_ string, at time.Time) float64 {
-		if v, ok := overrides[at]; ok {
-			return v
+		for end, v := range collapsed {
+			if !at.Before(end.Add(-time.Hour)) && at.Before(end) {
+				return v
+			}
 		}
 		return normal
 	}
@@ -136,7 +142,7 @@ func TestVisitsDropFiresAlert(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
@@ -148,11 +154,11 @@ func TestVisitsDropFiresAlert(t *testing.T) {
 	if !strings.Contains(alert.title, "Визиты") || !strings.Contains(alert.title, "упали") {
 		t.Errorf("title = %q", alert.title)
 	}
-	// 30 against a baseline of 100 is a 70% drop.
+	// 30 per bucket against 100 per bucket is a 70% drop either way.
 	if !strings.Contains(alert.title, "70%") {
 		t.Errorf("title should carry the size of the drop: %q", alert.title)
 	}
-	for _, want := range []string{"вторник", "Обычно в этот час", "100", "30"} {
+	for _, want := range []string{"вторник", "Обычно в это время", "600", "180"} {
 		if !strings.Contains(alert.message, want) {
 			t.Errorf("message is missing %q:\n%s", want, alert.message)
 		}
@@ -176,7 +182,7 @@ func TestQuietHourIsNotAnAnomaly(t *testing.T) {
 	})
 
 	night := time.Date(2026, 9, 8, 3, 0, 0, 0, time.Local)
-	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, night)
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, night)
 	if err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
@@ -193,7 +199,7 @@ func TestRiseFiresOnlyForRiseRules(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, _ := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if fired != 0 {
 		t.Fatalf("a drop rule fired on a spike")
 	}
@@ -202,7 +208,7 @@ func TestRiseFiresOnlyForRiseRules(t *testing.T) {
 		Name: "Всплеск", Metric: "visits", Direction: DirectionRise,
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
-	fired, _ = h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, _ = h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if fired != 1 {
 		t.Fatalf("fired = %d, want the rise rule to fire", fired)
 	}
@@ -218,7 +224,8 @@ func TestGoalDropFiresAlert(t *testing.T) {
 		if metric != "ym:s:goal42reaches" {
 			return 1000 // traffic is healthy
 		}
-		if at.Equal(tuesday3pm) {
+		// The goal collapses only inside the window under test.
+		if !at.Before(tuesday3pm.Add(-time.Hour)) && at.Before(tuesday3pm) {
 			return 1
 		}
 		return 20
@@ -230,7 +237,7 @@ func TestGoalDropFiresAlert(t *testing.T) {
 		DeviationPct: 50, MinBaseline: 5, Cooldown: 180,
 	})
 
-	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
@@ -253,7 +260,7 @@ func TestTriggersShareOneRequest(t *testing.T) {
 		})
 	}
 
-	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 
@@ -275,7 +282,7 @@ func TestDistinctMetricsShareOneRequest(t *testing.T) {
 		})
 	}
 
-	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 
@@ -303,7 +310,7 @@ func TestRequestWindowCoversTheDeepestBaseline(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, BaselineWeeks: 8, Cooldown: 180,
 	})
 
-	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 
@@ -312,17 +319,18 @@ func TestRequestWindowCoversTheDeepestBaseline(t *testing.T) {
 		t.Fatalf("date1: %v", err)
 	}
 	if span := tuesday3pm.Sub(date1); span < 8*7*24*time.Hour {
-		t.Errorf("window spans %s, too short for an 8-week baseline", span)
+		t.Errorf("range spans %s, too short for an 8-week baseline", span)
 	}
-	if fake.lastRequest().Get("group") != GroupHour {
-		t.Errorf("group = %q, want hour", fake.lastRequest().Get("group"))
+	// Ten-minute buckets are what the sliding window is summed from.
+	if fake.lastRequest().Get("group") != GroupTenMinutes {
+		t.Errorf("group = %q, want %q", fake.lastRequest().Get("group"), GroupTenMinutes)
 	}
 }
 
 func TestCooldownSuppressesRepeatAlerts(t *testing.T) {
 	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{
-		tuesday3pm:                20,
-		tuesday3pm.Add(time.Hour): 20,
+		tuesday3pm:               20,
+		tuesday3pm.Add(fakeStep): 20,
 	})}
 	h := newEvalHarness(t, fake)
 	h.addTrigger(t, &model.Trigger{
@@ -330,11 +338,11 @@ func TestCooldownSuppressesRepeatAlerts(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	if fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); fired != 1 {
+	if fired, _ := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); fired != 1 {
 		t.Fatalf("first hour fired %d, want 1", fired)
 	}
-	if fired, _ := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm.Add(time.Hour)); fired != 0 {
-		t.Errorf("the next hour alerted again despite a 180-minute cooldown")
+	if fired, _ := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm.Add(fakeStep)); fired != 0 {
+		t.Errorf("the next window alerted again despite a 180-minute cooldown")
 	}
 }
 
@@ -350,7 +358,7 @@ func TestDisabledTriggerIsIgnored(t *testing.T) {
 		t.Fatalf("UpdateTrigger: %v", err)
 	}
 
-	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
@@ -371,7 +379,7 @@ func TestFiredAlertIsPersisted(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 
@@ -382,9 +390,10 @@ func TestFiredAlertIsPersisted(t *testing.T) {
 	if len(alerts) != 1 {
 		t.Fatalf("stored %d alerts, want 1", len(alerts))
 	}
-	// The absolute figure that fired it is kept for the history view.
-	if alerts[0].EventCount != 20 {
-		t.Errorf("event_count = %d, want the observed 20", alerts[0].EventCount)
+	// The figure kept for the history view is the window total — six
+	// ten-minute buckets of 20 — not a single bucket.
+	if alerts[0].EventCount != 120 {
+		t.Errorf("event_count = %d, want the 120 observed across the window", alerts[0].EventCount)
 	}
 }
 
@@ -399,7 +408,7 @@ func TestSampledDataIsFlaggedInTheAlert(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	if _, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm); err != nil {
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 	if !strings.Contains(h.router.last().message, "семплированы") {
@@ -422,11 +431,58 @@ func TestBadMetricDoesNotStopOtherRules(t *testing.T) {
 		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
 	})
 
-	fired, err := h.evaluator.EvaluateHour(context.Background(), h.counter, tuesday3pm)
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
 	if err != nil {
 		t.Fatalf("EvaluateHour: %v", err)
 	}
 	if fired != 1 {
 		t.Errorf("fired = %d, want the working rule to still fire", fired)
+	}
+}
+
+// Metrika may coarsen a grouping it considers too fine for the range. Reading a
+// coarser series as ten-minute buckets would sum windows from the wrong spans,
+// so the evaluator must refuse rather than report a confident wrong number.
+func TestCoarsenedSeriesIsRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hourly intervals, not the ten-minute ones that were asked for.
+		start := tuesday3pm.AddDate(0, 0, -30)
+		var intervals [][]string
+		var values []float64
+		for at := start; !at.After(tuesday3pm); at = at.Add(time.Hour) {
+			intervals = append(intervals, []string{at.Format("2006-01-02 15:04:05")})
+			values = append(values, 100)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"totals":         [][]float64{values},
+			"time_intervals": intervals,
+		})
+	}))
+	defer srv.Close()
+
+	db, err := model.OpenDB(filepath.Join(t.TempDir(), "coarse.db"))
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	counter := testCounter()
+	if err := db.CreateCounter(context.Background(), counter); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	if err := db.CreateTrigger(context.Background(), &model.Trigger{
+		CounterID: counter.ID, Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, BaselineWeeks: 4, Cooldown: 180, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateTrigger: %v", err)
+	}
+
+	evaluator := NewEvaluator(db, &fakeRouter{}, &MetrikaConfig{BaseURL: srv.URL})
+	_, err = evaluator.EvaluateWindow(context.Background(), counter, tuesday3pm)
+	if err == nil {
+		t.Fatal("a coarsened series was accepted")
+	}
+	if !strings.Contains(err.Error(), "intervals") {
+		t.Errorf("error should name the resolution mismatch: %v", err)
 	}
 }

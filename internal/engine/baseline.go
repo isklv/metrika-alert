@@ -81,18 +81,20 @@ func ValidDirection(d string) bool {
 	return false
 }
 
-// slot identifies a position in the weekly rhythm: traffic at Tuesday 15:00 is
-// only comparable with other Tuesdays at 15:00.
+// slot identifies a position in the weekly rhythm. Traffic at Tuesday 15:20 is
+// only comparable with other Tuesdays at 15:20, so a slot is a weekday plus a
+// minute of the day — not merely an hour, because the measurement window slides
+// in ten-minute steps.
 type slot struct {
-	weekday time.Weekday
-	hour    int
+	weekday     time.Weekday
+	minuteOfDay int
 }
 
 func slotOf(t time.Time) slot {
-	return slot{weekday: t.Weekday(), hour: t.Hour()}
+	return slot{weekday: t.Weekday(), minuteOfDay: t.Hour()*60 + t.Minute()}
 }
 
-// Baseline is what one hour is judged against.
+// Baseline is what one window is judged against.
 type Baseline struct {
 	// Value is the expected figure for this slot.
 	Value float64
@@ -100,26 +102,50 @@ type Baseline struct {
 	Samples int
 }
 
-// BuildBaseline computes the expected value for the slot at `at`, from the same
-// weekday and hour in earlier weeks of the series.
+// WindowSum totals a metric over [end-window, end).
+//
+// The measurement window is an hour wide even though it advances every ten
+// minutes: a bare ten-minute bucket carries a sixth of the traffic and swings
+// far too much week to week for a percentage threshold to mean anything.
+// Summing six of them keeps the signal at hourly scale while the window still
+// moves at ten-minute cadence.
+func WindowSum(series *TimeSeries, metric int, end time.Time, window time.Duration) (float64, bool) {
+	step := series.Step()
+	if step <= 0 {
+		return 0, false
+	}
+
+	var total float64
+	for at := end.Add(-window); at.Before(end); at = at.Add(step) {
+		i := series.IndexOf(at)
+		if i < 0 {
+			return 0, false
+		}
+		v, ok := series.At(metric, i)
+		if !ok {
+			return 0, false
+		}
+		total += v
+	}
+	return total, true
+}
+
+// BuildBaseline computes the expected value for the window ending at `end`,
+// from the same weekday and time of day in earlier weeks.
 //
 // The median is used rather than the mean: one holiday, outage or newsletter
 // spike in the history would drag a mean far enough to hide the very anomaly
 // the trigger exists to catch.
-func BuildBaseline(series *TimeSeries, metric int, at time.Time) Baseline {
-	target := slotOf(at)
-
+func BuildBaseline(series *TimeSeries, metric int, end time.Time, window time.Duration, weeks int) Baseline {
 	var samples []float64
-	for i, interval := range series.Intervals {
-		// The hour being judged is not part of its own baseline, and neither is
-		// anything after it.
-		if !interval.Before(at) {
+
+	for week := 1; week <= weeks; week++ {
+		past := end.AddDate(0, 0, -7*week)
+		// Guard the weekly rhythm against a DST shift moving the slot.
+		if slotOf(past) != slotOf(end) {
 			continue
 		}
-		if slotOf(interval) != target {
-			continue
-		}
-		if v, ok := series.At(metric, i); ok {
+		if v, ok := WindowSum(series, metric, past, window); ok {
 			samples = append(samples, v)
 		}
 	}

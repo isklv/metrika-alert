@@ -39,13 +39,18 @@ type MetrikaCfg struct {
 	// BaseURL serves both the Reporting API (/stat/v1/data) and the Logs API
 	// (/management/v1/...), so one host covers everything.
 	BaseURL string `yaml:"base_url"`
-	// SettleMinutes is how long after an hour closes before it is judged.
-	// Metrika keeps counting sessions for a short while past the boundary, so
-	// judging an hour the moment it ends reads low.
+	// SettleMinutes is how long data is left to settle before it is judged.
+	// Metrika keeps counting sessions for a short while after they happen, so
+	// measuring right up to the present reads low.
 	SettleMinutes int `yaml:"settle_minutes"`
-	// MaxCatchUpHours bounds how many missed hours one check works through,
+	// WindowMinutes is how much traffic one measurement covers.
+	WindowMinutes int `yaml:"window_minutes"`
+	// StepMinutes is how often the window advances, and so how quickly a drop
+	// is noticed.
+	StepMinutes int `yaml:"step_minutes"`
+	// MaxCatchUpSteps bounds how many missed windows one check works through,
 	// so a counter idle for a week does not fire a burst of stale alerts.
-	MaxCatchUpHours int `yaml:"max_catch_up_hours"`
+	MaxCatchUpSteps int `yaml:"max_catch_up_steps"`
 }
 
 type APICfg struct {
@@ -66,10 +71,12 @@ var legacyMetrikaHosts = map[string]bool{
 	"https://logs.metrika.yandex.ru": true,
 }
 
-// Hourly checking defaults.
+// Measurement defaults: an hour-wide window advancing every ten minutes.
 const (
 	DefaultSettleMinutes   = 20
-	DefaultMaxCatchUpHours = 6
+	DefaultWindowMinutes   = 60
+	DefaultStepMinutes     = 10
+	DefaultMaxCatchUpSteps = 6
 )
 
 // DefaultVKTeamsURL is the VK Teams cloud bot API. On-premise installations
@@ -90,7 +97,9 @@ const DefaultVKTeamsURL = "https://myteam.mail.ru/bot/v1"
 //	METRIKA_VKTEAMS_PROXY   — proxy URL for VK Teams
 //	METRIKA_METRIKA_BASE    — metrika API base URL
 //	METRIKA_SETTLE_MINUTES  — delay before a closed hour is judged
-//	METRIKA_MAX_CATCH_UP_HOURS — how many missed hours one check works through
+//	METRIKA_WINDOW_MINUTES  — width of one measurement window
+//	METRIKA_STEP_MINUTES    — how often the window advances
+//	METRIKA_MAX_CATCH_UP_STEPS — how many missed windows one check works through
 //	METRIKA_API_LISTEN      — REST API listen address
 //	METRIKA_API_ENABLED     — "true" to enable the REST API
 //	METRIKA_API_TOKEN       — bearer token required by the REST API
@@ -125,8 +134,14 @@ func applyDefaults(c *Config) {
 	if c.Metrika.SettleMinutes <= 0 {
 		c.Metrika.SettleMinutes = DefaultSettleMinutes
 	}
-	if c.Metrika.MaxCatchUpHours <= 0 {
-		c.Metrika.MaxCatchUpHours = DefaultMaxCatchUpHours
+	if c.Metrika.WindowMinutes <= 0 {
+		c.Metrika.WindowMinutes = DefaultWindowMinutes
+	}
+	if c.Metrika.StepMinutes <= 0 {
+		c.Metrika.StepMinutes = DefaultStepMinutes
+	}
+	if c.Metrika.MaxCatchUpSteps <= 0 {
+		c.Metrika.MaxCatchUpSteps = DefaultMaxCatchUpSteps
 	}
 	if c.VKTeams.BaseURL == "" {
 		c.VKTeams.BaseURL = DefaultVKTeamsURL
@@ -184,9 +199,19 @@ func applyEnvOverrides(c *Config) {
 			c.Metrika.SettleMinutes = m
 		}
 	}
-	if v := os.Getenv("METRIKA_MAX_CATCH_UP_HOURS"); v != "" {
-		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h > 0 {
-			c.Metrika.MaxCatchUpHours = h
+	if v := os.Getenv("METRIKA_WINDOW_MINUTES"); v != "" {
+		if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+			c.Metrika.WindowMinutes = m
+		}
+	}
+	if v := os.Getenv("METRIKA_STEP_MINUTES"); v != "" {
+		if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+			c.Metrika.StepMinutes = m
+		}
+	}
+	if v := os.Getenv("METRIKA_MAX_CATCH_UP_STEPS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.Metrika.MaxCatchUpSteps = n
 		}
 	}
 	if v := os.Getenv("METRIKA_API_LISTEN"); v != "" {

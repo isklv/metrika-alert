@@ -31,9 +31,9 @@ func NewEvaluator(db *model.DB, router AlertRouter, cfg *MetrikaConfig) *Evaluat
 // is trusted. Below this the median says more about luck than about the site.
 const minSamples = 2
 
-// EvaluateHour judges every enabled trigger of a counter for the given hour and
-// reports how many alerts it delivered.
-func (e *Evaluator) EvaluateHour(ctx context.Context, counter *model.Counter, hour time.Time) (int, error) {
+// EvaluateWindow judges every enabled trigger of a counter for the measurement
+// window ending at `end`, and reports how many alerts it delivered.
+func (e *Evaluator) EvaluateWindow(ctx context.Context, counter *model.Counter, end time.Time) (int, error) {
 	triggers, err := e.db.ListTriggers(ctx, counter.ID)
 	if err != nil {
 		return 0, fmt.Errorf("list triggers: %w", err)
@@ -49,14 +49,14 @@ func (e *Evaluator) EvaluateHour(ctx context.Context, counter *model.Counter, ho
 		return 0, nil
 	}
 
-	series, index, err := e.fetchSeries(ctx, counter, enabled, hour)
+	series, index, err := e.fetchSeries(ctx, counter, enabled, end)
 	if err != nil {
 		return 0, err
 	}
 
 	var fired int
 	for _, t := range enabled {
-		delivered, err := e.evaluateTrigger(ctx, counter, &t, series, index, hour)
+		delivered, err := e.evaluateTrigger(ctx, counter, &t, series, index, end)
 		if err != nil {
 			log.Printf("counter %s: trigger %d (%s): %v", counter.CounterID, t.ID, t.Name, err)
 			continue
@@ -72,7 +72,7 @@ func (e *Evaluator) EvaluateHour(ctx context.Context, counter *model.Counter, ho
 // one request. The window has to reach back far enough to hold the deepest
 // baseline any trigger asks for, and the metrics are deduplicated so a counter
 // with ten visit triggers still costs one call.
-func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, triggers []model.Trigger, hour time.Time) (*TimeSeries, map[string]int, error) {
+func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, triggers []model.Trigger, end time.Time) (*TimeSeries, map[string]int, error) {
 	index := make(map[string]int)
 	var metrics []string
 	weeks := 1
@@ -99,19 +99,28 @@ func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, tri
 		return nil, nil, fmt.Errorf("counter watches %d distinct metrics, the API allows 20 per request", len(metrics))
 	}
 
-	// Reach one day past the oldest week so the slot at the far end is whole.
-	from := hour.AddDate(0, 0, -7*weeks-1)
+	// Reach one day past the oldest week so the window at the far end is whole.
+	from := end.AddDate(0, 0, -7*weeks-1)
 	client := NewReportClient(counter, e.cfg.BaseURL)
 
-	series, err := client.FetchByTime(ctx, metrics, from.Format("2006-01-02"), hour.Format("2006-01-02"))
+	series, err := client.FetchByTime(ctx, metrics,
+		from.Format("2006-01-02"), end.Format("2006-01-02"), GroupTenMinutes)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// The API may coarsen a grouping it considers too fine for the range.
+	// Reading a coarser series as if it were ten-minute buckets would compute
+	// windows from the wrong spans, so this stops instead of guessing.
+	if step := series.Step(); step != 0 && step != e.cfg.step() {
+		return nil, nil, fmt.Errorf("Metrika returned %s intervals, expected %s — сократите baseline_weeks",
+			step, e.cfg.step())
 	}
 	return series, index, nil
 }
 
 // evaluateTrigger judges one trigger and delivers an alert when it fires.
-func (e *Evaluator) evaluateTrigger(ctx context.Context, counter *model.Counter, t *model.Trigger, series *TimeSeries, index map[string]int, hour time.Time) (bool, error) {
+func (e *Evaluator) evaluateTrigger(ctx context.Context, counter *model.Counter, t *model.Trigger, series *TimeSeries, index map[string]int, end time.Time) (bool, error) {
 	apiMetric, err := ResolveMetric(t.Metric)
 	if err != nil {
 		return false, err
@@ -121,16 +130,13 @@ func (e *Evaluator) evaluateTrigger(ctx context.Context, counter *model.Counter,
 		return false, fmt.Errorf("metric %s missing from the series", apiMetric)
 	}
 
-	hourIdx := series.IndexOf(hour)
-	if hourIdx < 0 {
-		return false, fmt.Errorf("hour %s is not in the returned series", hour.Format(time.RFC3339))
-	}
-	current, ok := series.At(metricIdx, hourIdx)
+	window := e.cfg.window()
+	current, ok := WindowSum(series, metricIdx, end, window)
 	if !ok {
-		return false, fmt.Errorf("no value for %s at %s", apiMetric, hour.Format(time.RFC3339))
+		return false, fmt.Errorf("window ending %s is not covered by the returned series", end.Format(time.RFC3339))
 	}
 
-	baseline := BuildBaseline(series, metricIdx, hour)
+	baseline := BuildBaseline(series, metricIdx, end, window, t.BaselineWeeks)
 	verdict := Judge(current, baseline, t.Direction, t.DeviationPct, t.MinBaseline, minSamples)
 
 	if !verdict.Fired {
@@ -143,7 +149,7 @@ func (e *Evaluator) evaluateTrigger(ctx context.Context, counter *model.Counter,
 	}
 
 	title := e.buildTitle(counter, t, verdict)
-	message := e.buildMessage(t, verdict, hour, series.Sampled)
+	message := e.buildMessage(t, verdict, end, window, series.Sampled)
 
 	if err := e.alert.Alert(ctx, counter.ID, title, message); err != nil {
 		log.Printf("counter %s: deliver alert for trigger %d: %v", counter.CounterID, t.ID, err)
@@ -204,16 +210,18 @@ func changeVerb(metric string, deviationPct float64) string {
 	return "упали"
 }
 
-func (e *Evaluator) buildMessage(t *model.Trigger, v Verdict, hour time.Time, sampled bool) string {
+func (e *Evaluator) buildMessage(t *model.Trigger, v Verdict, end time.Time, window time.Duration, sampled bool) string {
 	var b strings.Builder
+	start := end.Add(-window)
 
 	fmt.Fprintf(&b, "*Правило:* %s\n", t.Name)
-	fmt.Fprintf(&b, "*Час:* %s, %s\n", hour.Format("02.01 15:00"), weekdayName(hour.Weekday()))
+	fmt.Fprintf(&b, "*Окно:* %s–%s, %s\n",
+		start.Format("02.01 15:04"), end.Format("15:04"), weekdayName(end.Weekday()))
 	fmt.Fprintf(&b, "*%s:* %.0f\n", MetricLabel(t.Metric), v.Current)
-	fmt.Fprintf(&b, "*Обычно в этот час:* %.0f\n", v.Baseline.Value)
+	fmt.Fprintf(&b, "*Обычно в это время:* %.0f\n", v.Baseline.Value)
 	fmt.Fprintf(&b, "*Отклонение:* %+.0f%% при пороге %d%%\n", v.DeviationPct, t.DeviationPct)
-	fmt.Fprintf(&b, "\n_База — медиана %d последних %s в этот час._",
-		v.Baseline.Samples, pluralWeekday(v.Baseline.Samples, hour.Weekday()))
+	fmt.Fprintf(&b, "\n_База — медиана %d последних %s в это же время._",
+		v.Baseline.Samples, pluralWeekday(v.Baseline.Samples, end.Weekday()))
 
 	if sampled {
 		b.WriteString("\n_Данные семплированы._")
