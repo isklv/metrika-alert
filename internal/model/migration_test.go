@@ -344,3 +344,64 @@ func TestHourCursorRoundTrips(t *testing.T) {
 		t.Errorf("cursor = %v, want %v", got.LastHourChecked, hour)
 	}
 }
+
+// A database created before URL scoping must gain the columns and keep its rules.
+func TestMigrationAddsURLScopeColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prescope.db")
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE counters (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+			counter_id TEXT UNIQUE NOT NULL, oauth_token TEXT NOT NULL,
+			poll_interval_minutes INTEGER NOT NULL DEFAULT 60,
+			last_hour_checked DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+		CREATE TABLE triggers (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, counter_id INTEGER NOT NULL,
+			name TEXT NOT NULL, metric TEXT NOT NULL,
+			direction TEXT NOT NULL DEFAULT 'drop' CHECK(direction IN ('drop','rise','both')),
+			deviation_percent INTEGER NOT NULL DEFAULT 30, min_baseline INTEGER NOT NULL DEFAULT 10,
+			baseline_weeks INTEGER NOT NULL DEFAULT 4, cooldown_minutes INTEGER NOT NULL DEFAULT 180,
+			enabled BOOLEAN NOT NULL DEFAULT 1, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+		INSERT INTO counters (id, name, counter_id, oauth_token) VALUES (1, 'Магазин', '12345678', 'y0_tok');
+		INSERT INTO triggers (counter_id, name, metric, deviation_percent) VALUES (1, 'Визиты', 'visits', 40);
+	` + legacySchema); err != nil {
+		t.Fatalf("create pre-scope schema: %v", err)
+	}
+	raw.Close()
+
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	triggers, err := db.ListTriggers(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListTriggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("got %d rules after migration, want the 1 that existed", len(triggers))
+	}
+	// An existing rule keeps watching the whole counter.
+	if triggers[0].URLFilter != "" || triggers[0].URLMatch != "" {
+		t.Errorf("migration invented a scope: %+v", triggers[0])
+	}
+
+	if err := db.CreateTrigger(ctx, &Trigger{
+		CounterID: 1, Name: "Чекаут", Metric: "visits", Direction: "drop",
+		DeviationPct: 40, MinBaseline: 10, BaselineWeeks: 4, Cooldown: 180,
+		URLFilter: "/checkout", URLMatch: "contains", Enabled: true,
+	}); err != nil {
+		t.Fatalf("migrated database rejects a scoped rule: %v", err)
+	}
+
+	scoped, _ := db.ListTriggers(ctx, 1)
+	if len(scoped) != 2 || scoped[1].URLFilter != "/checkout" {
+		t.Errorf("scoped rule did not round-trip: %+v", scoped)
+	}
+}

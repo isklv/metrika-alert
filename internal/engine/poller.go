@@ -22,7 +22,22 @@ type Poller struct {
 	evaluator *Evaluator
 
 	mu      sync.Mutex
-	running bool
+	started bool
+	// emptyLogged keeps the "no counters" notice to the moment the set becomes
+	// empty. Repeating it every reconcile would bury an idle install's log.
+	emptyLogged bool
+	// watched holds one entry per counter currently being polled. Counters are
+	// added and removed as the database changes, so a counter created through
+	// the bot starts being checked without restarting the service.
+	watched map[int64]*watch
+}
+
+// watch is a running per-counter polling goroutine.
+type watch struct {
+	cancel context.CancelFunc
+	// interval is what the goroutine was started with, so a change to the
+	// counter's setting can be noticed and applied.
+	interval time.Duration
 }
 
 // MetrikaConfig points the engine at the API and bounds how it reads history.
@@ -83,44 +98,146 @@ func (c *MetrikaConfig) maxCatchUp() int {
 }
 
 func NewPoller(db *model.DB, cfg *MetrikaConfig, evaluator *Evaluator) *Poller {
-	return &Poller{db: db, cfg: cfg, evaluator: evaluator}
+	return &Poller{db: db, cfg: cfg, evaluator: evaluator, watched: make(map[int64]*watch)}
 }
 
-// Start launches one goroutine per counter and returns immediately.
+// reconcileInterval is how often the set of polled counters is compared with
+// the database. It only costs one local query, so it can be brisk: this is the
+// delay between adding a counter and the service starting to check it.
+const reconcileInterval = 30 * time.Second
+
+// Start begins polling and returns immediately.
+//
+// The set of counters is reconciled with the database on a timer rather than
+// read once, so counters added, removed or retuned through the bot or the API
+// take effect on their own — restarting the service to pick up a new counter
+// was a wart, and a deleted one used to leave its goroutine running forever.
 func (p *Poller) Start(ctx context.Context) error {
 	p.mu.Lock()
-	if p.running {
+	if p.started {
 		p.mu.Unlock()
 		return fmt.Errorf("poller already running")
 	}
-	p.running = true
+	p.started = true
 	p.mu.Unlock()
 
+	// Reconcile once inline so a broken database surfaces at startup rather
+	// than as a log line half a minute later.
+	if err := p.reconcile(ctx); err != nil {
+		return err
+	}
+	log.Printf("poller started: %s window stepped every %s, %s to settle, счётчики подхватываются на лету",
+		p.cfg.window(), p.cfg.step(), p.cfg.settle())
+
+	go p.supervise(ctx)
+	return nil
+}
+
+// supervise keeps the polled set in step with the database until ctx ends.
+func (p *Poller) supervise(ctx context.Context) {
+	ticker := time.NewTicker(reconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			p.stopAll()
+			return
+		case <-ticker.C:
+			if err := p.reconcile(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("poller: reconcile: %v", err)
+			}
+		}
+	}
+}
+
+// reconcile starts goroutines for counters that have none, stops those whose
+// counter is gone, and restarts any whose interval changed.
+func (p *Poller) reconcile(ctx context.Context) error {
 	counters, err := p.db.ListCounters(ctx)
 	if err != nil {
 		return fmt.Errorf("list counters: %w", err)
 	}
-	if len(counters) == 0 {
-		log.Printf("poller started: no counters configured — add one with /addcounter")
-		return nil
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	present := make(map[int64]bool, len(counters))
+	for _, c := range counters {
+		present[c.ID] = true
+		interval := pollInterval(c)
+
+		if existing, ok := p.watched[c.ID]; ok {
+			if existing.interval == interval {
+				continue
+			}
+			// The cadence changed; replace the goroutine with one that ticks
+			// at the new rate.
+			existing.cancel()
+			delete(p.watched, c.ID)
+			log.Printf("counter %s: интервал проверки изменён на %s", c.CounterID, interval)
+		}
+
+		counterCtx, cancel := context.WithCancel(ctx)
+		p.watched[c.ID] = &watch{cancel: cancel, interval: interval}
+		go p.pollCounterLoop(counterCtx, c, interval)
+		log.Printf("counter %s: проверка запущена, каждые %s", c.CounterID, interval)
 	}
 
-	for _, c := range counters {
-		go p.pollCounterLoop(ctx, c)
+	for id, w := range p.watched {
+		if present[id] {
+			continue
+		}
+		w.cancel()
+		delete(p.watched, id)
+		log.Printf("counter %d: удалён, проверка остановлена", id)
 	}
-	log.Printf("poller started: %d counter(s), %s window stepped every %s, %s to settle",
-		len(counters), p.cfg.window(), p.cfg.step(), p.cfg.settle())
+
+	switch {
+	case len(p.watched) == 0 && !p.emptyLogged:
+		log.Printf("poller: счётчиков нет — добавьте первый через /addcounter")
+		p.emptyLogged = true
+	case len(p.watched) > 0:
+		p.emptyLogged = false
+	}
 	return nil
 }
 
-func (p *Poller) pollCounterLoop(ctx context.Context, c model.Counter) {
+// stopAll ends every polling goroutine.
+func (p *Poller) stopAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, w := range p.watched {
+		w.cancel()
+		delete(p.watched, id)
+	}
+}
+
+// Watched reports how many counters are currently being polled.
+func (p *Poller) Watched() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.watched)
+}
+
+// pollInterval is how often a counter is checked, floored at a minute.
+func pollInterval(c model.Counter) time.Duration {
 	interval := time.Duration(c.PollInterval) * time.Minute
 	if interval < time.Minute {
 		interval = time.Minute
 	}
+	return interval
+}
 
+func (p *Poller) pollCounterLoop(ctx context.Context, c model.Counter, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	// Check straight away: a counter added a moment ago should not wait a full
+	// interval before its first look, which is what made adding one feel inert.
+	if err := p.advance(ctx, c.ID); err != nil && ctx.Err() == nil {
+		log.Printf("poll counter %d (%s): %v", c.ID, c.CounterID, err)
+	}
 
 	for {
 		select {

@@ -100,6 +100,7 @@ func main() {
 		MaxCatchUpSteps: cfg.Metrika.MaxCatchUpSteps,
 	}
 	evaluator := engine.NewEvaluator(db, router, metrikaCfg)
+	lookup := engine.NewLookup(metrikaCfg)
 	poller := engine.NewPoller(db, metrikaCfg, evaluator)
 	reporter := engine.NewReporter(db, metrikaCfg, router)
 
@@ -126,20 +127,20 @@ func main() {
 		}
 		warnIfNoAdmins("telegram", len(admins))
 
-		b := bot.New(bot.NewTelegramTransport(tgBot), db, tasks, admins)
+		b := bot.New(bot.NewTelegramTransport(tgBot), db, tasks, lookup, admins)
 		wg.Go(func() { bot.RunTelegram(ctx, tgBot, b) })
 	}
 
 	if vkClient != nil {
 		warnIfNoAdmins("vkteams", len(cfg.VKTeams.AdminIDs))
 
-		b := bot.New(bot.NewVKTeamsTransport(vkClient), db, tasks, cfg.VKTeams.AdminIDs)
+		b := bot.New(bot.NewVKTeamsTransport(vkClient), db, tasks, lookup, cfg.VKTeams.AdminIDs)
 		wg.Go(func() { bot.RunVKTeams(ctx, vkClient, b) })
 	}
 
 	// --- REST API -----------------------------------------------------------
 	if cfg.API.Enabled {
-		apiServer := api.NewServer(db, reporter, poller, api.Config{
+		apiServer := api.NewServer(db, reporter, poller, lookup, api.Config{
 			ListenAddr: cfg.API.ListenAddr,
 			AuthToken:  cfg.API.AuthToken,
 			Metrika:    metrikaCfg,

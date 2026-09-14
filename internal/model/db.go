@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS triggers (
 	deviation_percent INTEGER NOT NULL DEFAULT 30,
 	min_baseline INTEGER NOT NULL DEFAULT 10,
 	baseline_weeks INTEGER NOT NULL DEFAULT 4,
+	url_filter TEXT NOT NULL DEFAULT '',
+	url_match TEXT NOT NULL DEFAULT '',
 	cooldown_minutes INTEGER NOT NULL DEFAULT 180,
 	enabled BOOLEAN NOT NULL DEFAULT 1,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -119,10 +121,15 @@ func migrate(db *sql.DB) error {
 	if err := migrateTriggersTable(db); err != nil {
 		return err
 	}
-	// CREATE TABLE IF NOT EXISTS leaves an existing counters table untouched,
-	// so the hour cursor has to be added explicitly.
+	// CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so columns
+	// added since have to be applied explicitly.
 	if err := addColumnIfMissing(db, "counters", "last_hour_checked", "DATETIME"); err != nil {
 		return err
+	}
+	for _, column := range []string{"url_filter", "url_match"} {
+		if err := addColumnIfMissing(db, "triggers", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
 	}
 	return dropObsoleteTables(db)
 }

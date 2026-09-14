@@ -155,9 +155,47 @@ func (c *ReportClient) Fetch(ctx context.Context, q Query) (*Result, error) {
 
 // Goal is a conversion goal configured on the counter.
 type Goal struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"type"`
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Status     string `json:"status"`
+	IsFavorite bool   `json:"is_favorite"`
+}
+
+// Active reports whether the goal is still in use. The API does not document
+// the status values, so anything it does not explicitly mark as deleted counts
+// as active — guessing the other way would hide real goals.
+func (g Goal) Active() bool {
+	return !strings.EqualFold(g.Status, "Deleted")
+}
+
+// goalTypeLabels renders the documented goal types in Russian. An unknown type
+// falls through to its own name rather than being dropped.
+var goalTypeLabels = map[string]string{
+	"action":         "JS-событие",
+	"chat":           "чат",
+	"email":          "клик по email",
+	"file":           "скачивание файла",
+	"messenger":      "мессенджер",
+	"number":         "глубина просмотра",
+	"payment_system": "платёжная система",
+	"phone":          "клик по телефону",
+	"search":         "поиск по сайту",
+	"social":         "соцсеть",
+	"step":           "составная цель",
+	"url":            "посещение страницы",
+	"visit_duration": "время на сайте",
+}
+
+// TypeLabel renders the goal's type for a human.
+func (g Goal) TypeLabel() string {
+	if label, ok := goalTypeLabels[g.Type]; ok {
+		return label
+	}
+	if g.Type == "" {
+		return "цель"
+	}
+	return g.Type
 }
 
 // Goals lists the counter's goals so reports can break conversions down by
@@ -252,17 +290,16 @@ type byTimeResponse struct {
 
 // FetchByTime requests a time series at the given grouping.
 //
-// date1/date2 accept the API's own formats, so a caller can pass either
-// YYYY-MM-DD or a relative keyword.
-func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1, date2, group string) (*TimeSeries, error) {
-	if len(metrics) == 0 {
+// Query.Date1/Date2 accept the API's own formats, so a caller can pass either
+// YYYY-MM-DD or a relative keyword, and Query.Filters narrows the report.
+func (c *ReportClient) FetchByTime(ctx context.Context, q Query, group string) (*TimeSeries, error) {
+	if len(q.Metrics) == 0 {
 		return nil, fmt.Errorf("time series needs at least one metric")
 	}
-	if len(metrics) > 20 {
-		return nil, fmt.Errorf("time series has %d metrics, the API allows 20", len(metrics))
+	if len(q.Metrics) > 20 {
+		return nil, fmt.Errorf("time series has %d metrics, the API allows 20", len(q.Metrics))
 	}
 
-	q := Query{Metrics: metrics, Date1: date1, Date2: date2}
 	params := q.params(c.counterID)
 	if group == "" {
 		group = GroupHour
@@ -287,7 +324,7 @@ func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1,
 	if len(series.Intervals) == 0 {
 		// The field is not in the published schema, so the intervals are
 		// reconstructed from the request when the API omits them.
-		series.Intervals = deriveIntervals(date1, date2, groupStep(group), seriesLength(series.Values))
+		series.Intervals = deriveIntervals(q.Date1, q.Date2, groupStep(group), seriesLength(series.Values))
 	}
 	return series, nil
 }
@@ -366,4 +403,17 @@ func deriveIntervals(date1, date2 string, step time.Duration, count int) []time.
 		out[i] = start.Add(time.Duration(i) * step)
 	}
 	return out
+}
+
+// Lookup answers read-only questions about a counter's configuration in
+// Metrika, building a client per counter from its own stored token.
+type Lookup struct {
+	cfg *MetrikaConfig
+}
+
+func NewLookup(cfg *MetrikaConfig) *Lookup { return &Lookup{cfg: cfg} }
+
+// Goals lists the counter's conversion goals.
+func (l *Lookup) Goals(ctx context.Context, counter *model.Counter) ([]Goal, error) {
+	return NewReportClient(counter, l.cfg.BaseURL).Goals(ctx)
 }

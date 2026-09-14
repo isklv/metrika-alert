@@ -2,11 +2,13 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/isklv/metrika-alert/internal/engine"
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
@@ -34,6 +36,16 @@ func (f *fakeTransport) last() string {
 	return f.sent[len(f.sent)-1]
 }
 
+// fakeMetrika stands in for the counter-configuration lookup.
+type fakeMetrika struct {
+	goals []engine.Goal
+	err   error
+}
+
+func (f *fakeMetrika) Goals(context.Context, *model.Counter) ([]engine.Goal, error) {
+	return f.goals, f.err
+}
+
 func newTestBot(t *testing.T, admins ...string) (*Bot, *fakeTransport, *model.DB) {
 	t.Helper()
 	db, err := model.OpenDB(filepath.Join(t.TempDir(), "test.db"))
@@ -43,7 +55,7 @@ func newTestBot(t *testing.T, admins ...string) (*Bot, *fakeTransport, *model.DB
 	t.Cleanup(func() { db.Close() })
 
 	tr := &fakeTransport{}
-	return New(tr, db, nil, admins), tr, db
+	return New(tr, db, nil, &fakeMetrika{}, admins), tr, db
 }
 
 const admin = "admin@corp.ru"
@@ -274,5 +286,200 @@ func TestCommandFromNonAdminIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(tr.last(), "Доступ запрещён") {
 		t.Errorf("got %q", tr.last())
+	}
+}
+
+// ---- URL scoping in the rule syntax ----
+
+func TestAddTriggerWithURLScope(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Чекаут просел | visits | drop | 40 | url=/checkout")
+
+	triggers, err := db.ListTriggers(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ListTriggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers, want 1", len(triggers))
+	}
+
+	got := triggers[0]
+	if got.URLFilter != "/checkout" {
+		t.Errorf("url_filter = %q", got.URLFilter)
+	}
+	if got.URLMatch != "contains" {
+		t.Errorf("url_match = %q, want contains", got.URLMatch)
+	}
+	// The labelled field must not be mistaken for the positional numbers.
+	if got.MinBaseline != 10 || got.BaselineWeeks != 4 {
+		t.Errorf("defaults were consumed by the url field: %+v", got)
+	}
+}
+
+func TestAddTriggerWithRegexpScope(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, `Каталог | visits | drop | 35 | url~^/catalog/\d+`)
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	if triggers[0].URLMatch != "regexp" {
+		t.Errorf("url_match = %q, want regexp", triggers[0].URLMatch)
+	}
+	if triggers[0].URLFilter != `^/catalog/\d+` {
+		t.Errorf("url_filter = %q", triggers[0].URLFilter)
+	}
+}
+
+// The scope may follow the optional numbers as well as replace them.
+func TestAddTriggerWithScopeAfterOptionalNumbers(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Чекаут | goal:42 | drop | 50 | 5 | 6 | url=/checkout")
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	got := triggers[0]
+	if got.MinBaseline != 5 || got.BaselineWeeks != 6 {
+		t.Errorf("positional numbers were misread: %+v", got)
+	}
+	if got.URLFilter != "/checkout" {
+		t.Errorf("url_filter = %q", got.URLFilter)
+	}
+}
+
+// Rules written before URL scoping existed must keep working unchanged.
+func TestAddTriggerWithoutScopeStillWorks(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Визиты | visits | drop | 40 | 20 | 8")
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	got := triggers[0]
+	if got.URLFilter != "" || got.URLMatch != "" {
+		t.Errorf("an unscoped rule gained a scope: %+v", got)
+	}
+	if got.MinBaseline != 20 || got.BaselineWeeks != 8 {
+		t.Errorf("rule = %+v", got)
+	}
+}
+
+func TestAddTriggerRejectsBadScope(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+	say(t, b, "/addtrigger 1")
+
+	for _, bad := range []string{
+		"Каталог | visits | drop | 40 | url~^/catalog/[", // uncompilable regexp
+		"Каталог | visits | drop | 40 | url=",            // empty pattern
+		"Каталог | visits | drop | 40 | url=/a | url=/b", // two scopes
+	} {
+		say(t, b, bad)
+		if last := tr.last(); !strings.Contains(last, "❌") && !strings.Contains(last, "url") {
+			t.Errorf("input %q: expected a validation message, got %q", bad, last)
+		}
+	}
+
+	if triggers, _ := db.ListTriggers(context.Background(), 1); len(triggers) != 0 {
+		t.Fatalf("a malformed scope created %d rule(s)", len(triggers))
+	}
+}
+
+// ---- Goal discovery ----
+
+// Writing `goal:42` means knowing that 42 is the order confirmation, and that
+// number lives only in Metrika — so the bot has to be able to show it.
+func TestListGoalsShowsIDsAndUsage(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{goals: []engine.Goal{
+		{ID: 42, Name: "Покупка", Type: "action", IsFavorite: true},
+		{ID: 77, Name: "Регистрация", Type: "url"},
+	}}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	got := tr.last()
+	for _, want := range []string{"Покупка", "goal:42", "Регистрация", "goal:77"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("goal list is missing %q:\n%s", want, got)
+		}
+	}
+	// Types are rendered for a person, not as API identifiers.
+	if !strings.Contains(got, "JS-событие") || !strings.Contains(got, "посещение страницы") {
+		t.Errorf("goal types were not translated:\n%s", got)
+	}
+	// A ready-to-paste rule removes the last step of guesswork.
+	if !strings.Contains(got, "| goal:42 | drop |") {
+		t.Errorf("no example rule to copy:\n%s", got)
+	}
+}
+
+// The usual failure is a token without access to the counter's settings. That
+// must not read as "the feature is broken".
+func TestListGoalsExplainsAccessFailure(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{err: fmt.Errorf("metrika API 403: Access denied")}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	got := tr.last()
+	if !strings.Contains(got, "OAuth-токен") {
+		t.Errorf("the reply does not point at the likely cause:\n%s", got)
+	}
+	// Goal alerts still work without management access; say so.
+	if !strings.Contains(got, "всё равно работают") {
+		t.Errorf("the reply does not say alerts still work:\n%s", got)
+	}
+}
+
+func TestListGoalsWithNoneConfigured(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	if got := tr.last(); !strings.Contains(got, "нет настроенных целей") {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestListGoalsNeedsAKnownCounter(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+
+	say(t, b, "/goals 99")
+	if got := tr.last(); !strings.Contains(got, "не найден") {
+		t.Errorf("got %q", got)
+	}
+
+	say(t, b, "/goals")
+	if got := tr.last(); !strings.Contains(got, "ID") {
+		t.Errorf("got %q", got)
 	}
 }

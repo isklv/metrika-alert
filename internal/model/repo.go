@@ -103,20 +103,22 @@ func (db *DB) DeleteCounter(ctx context.Context, id int64) error {
 
 // ---- Triggers ----
 
-const triggerColumns = `id, counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, cooldown_minutes, enabled, created_at`
+const triggerColumns = `id, counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, url_filter, url_match, cooldown_minutes, enabled, created_at`
 
 func scanTrigger(row interface{ Scan(...any) error }) (Trigger, error) {
 	var t Trigger
 	err := row.Scan(&t.ID, &t.CounterID, &t.Name, &t.Metric, &t.Direction,
-		&t.DeviationPct, &t.MinBaseline, &t.BaselineWeeks, &t.Cooldown, &t.Enabled, &t.CreatedAt)
+		&t.DeviationPct, &t.MinBaseline, &t.BaselineWeeks, &t.URLFilter, &t.URLMatch,
+		&t.Cooldown, &t.Enabled, &t.CreatedAt)
 	return t, err
 }
 
 func (db *DB) CreateTrigger(ctx context.Context, t *Trigger) error {
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO triggers (counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, cooldown_minutes, enabled)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.CounterID, t.Name, t.Metric, t.Direction, t.DeviationPct, t.MinBaseline, t.BaselineWeeks, t.Cooldown, t.Enabled,
+		`INSERT INTO triggers (counter_id, name, metric, direction, deviation_percent, min_baseline, baseline_weeks, url_filter, url_match, cooldown_minutes, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.CounterID, t.Name, t.Metric, t.Direction, t.DeviationPct, t.MinBaseline, t.BaselineWeeks,
+		t.URLFilter, t.URLMatch, t.Cooldown, t.Enabled,
 	)
 	if err != nil {
 		return fmt.Errorf("create trigger: %w", err)

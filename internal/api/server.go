@@ -18,10 +18,16 @@ import (
 )
 
 // Server exposes REST endpoints for managing counters, monitors, triggers, alerts.
+// MetrikaLookup reads a counter's configuration from Metrika.
+type MetrikaLookup interface {
+	Goals(ctx context.Context, counter *model.Counter) ([]engine.Goal, error)
+}
+
 type Server struct {
 	db        *model.DB
 	reporter  *engine.Reporter
 	poller    *engine.Poller
+	lookup    MetrikaLookup
 	metrika   *engine.MetrikaConfig
 	mux       *http.ServeMux
 	listen    string
@@ -36,11 +42,12 @@ type Config struct {
 	Metrika    *engine.MetrikaConfig
 }
 
-func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, cfg Config) *Server {
+func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, lookup MetrikaLookup, cfg Config) *Server {
 	s := &Server{
 		db:        db,
 		reporter:  reporter,
 		poller:    poller,
+		lookup:    lookup,
 		metrika:   cfg.Metrika,
 		listen:    cfg.ListenAddr,
 		authToken: cfg.AuthToken,
@@ -80,6 +87,7 @@ func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/counters", s.withAuth(s.handleCounters))
+	s.mux.HandleFunc("/api/goals", s.withAuth(s.handleGoals))
 	s.mux.HandleFunc("/api/triggers", s.withAuth(s.handleTriggers))
 	s.mux.HandleFunc("/api/alert-actions", s.withAuth(s.handleAlertActions))
 	s.mux.HandleFunc("/api/alerts", s.withAuth(s.handleAlerts))
@@ -173,6 +181,38 @@ func (s *Server) createCounter(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(c)
 }
 
+// handleGoals lists a counter's conversion goals, so a caller can discover the
+// IDs that rules address as goal:<id>.
+func (s *Server) handleGoals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
+	if counterID <= 0 {
+		http.Error(w, "counter_id required", http.StatusBadRequest)
+		return
+	}
+	counter, err := s.db.GetCounter(r.Context(), counterID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if s.lookup == nil {
+		http.Error(w, "goal lookup is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	goals, err := s.lookup.Goals(r.Context(), counter)
+	if err != nil {
+		// The counter's token may lack access to its settings; that is a
+		// configuration answer, not a server fault.
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.getJSON(w, goals, nil)
+}
+
 func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request) {
 	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
 	switch r.Method {
@@ -206,6 +246,8 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 		DeviationPct  int    `json:"deviation_percent"`
 		MinBaseline   *int   `json:"min_baseline,omitempty"`
 		BaselineWeeks int    `json:"baseline_weeks"`
+		URLFilter     string `json:"url_filter"`
+		URLMatch      string `json:"url_match"`
 		Cooldown      int    `json:"cooldown_minutes"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -234,6 +276,18 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 	if body.BaselineWeeks <= 0 {
 		body.BaselineWeeks = defaultBaselineWeeks
 	}
+	if body.URLFilter != "" && body.URLMatch == "" {
+		body.URLMatch = engine.URLMatchContains
+	}
+	if !engine.ValidURLMatch(body.URLMatch) {
+		http.Error(w, "url_match must be contains or regexp", http.StatusBadRequest)
+		return
+	}
+	// Reject a bad pattern at creation, not at the first check hours later.
+	if _, err := engine.URLFilter(body.URLFilter, body.URLMatch); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if body.Cooldown <= 0 {
 		body.Cooldown = defaultCooldownMinutes
 	}
@@ -251,6 +305,8 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 		DeviationPct:  body.DeviationPct,
 		MinBaseline:   minBaseline,
 		BaselineWeeks: body.BaselineWeeks,
+		URLFilter:     strings.TrimSpace(body.URLFilter),
+		URLMatch:      body.URLMatch,
 		Cooldown:      body.Cooldown,
 		Enabled:       true,
 	}
