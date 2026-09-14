@@ -2,11 +2,13 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/isklv/metrika-alert/internal/engine"
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
@@ -34,6 +36,16 @@ func (f *fakeTransport) last() string {
 	return f.sent[len(f.sent)-1]
 }
 
+// fakeMetrika stands in for the counter-configuration lookup.
+type fakeMetrika struct {
+	goals []engine.Goal
+	err   error
+}
+
+func (f *fakeMetrika) Goals(context.Context, *model.Counter) ([]engine.Goal, error) {
+	return f.goals, f.err
+}
+
 func newTestBot(t *testing.T, admins ...string) (*Bot, *fakeTransport, *model.DB) {
 	t.Helper()
 	db, err := model.OpenDB(filepath.Join(t.TempDir(), "test.db"))
@@ -43,7 +55,7 @@ func newTestBot(t *testing.T, admins ...string) (*Bot, *fakeTransport, *model.DB
 	t.Cleanup(func() { db.Close() })
 
 	tr := &fakeTransport{}
-	return New(tr, db, nil, admins), tr, db
+	return New(tr, db, nil, &fakeMetrika{}, admins), tr, db
 }
 
 const admin = "admin@corp.ru"
@@ -391,5 +403,83 @@ func TestAddTriggerRejectsBadScope(t *testing.T) {
 
 	if triggers, _ := db.ListTriggers(context.Background(), 1); len(triggers) != 0 {
 		t.Fatalf("a malformed scope created %d rule(s)", len(triggers))
+	}
+}
+
+// ---- Goal discovery ----
+
+// Writing `goal:42` means knowing that 42 is the order confirmation, and that
+// number lives only in Metrika — so the bot has to be able to show it.
+func TestListGoalsShowsIDsAndUsage(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{goals: []engine.Goal{
+		{ID: 42, Name: "Покупка", Type: "action", IsFavorite: true},
+		{ID: 77, Name: "Регистрация", Type: "url"},
+	}}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	got := tr.last()
+	for _, want := range []string{"Покупка", "goal:42", "Регистрация", "goal:77"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("goal list is missing %q:\n%s", want, got)
+		}
+	}
+	// Types are rendered for a person, not as API identifiers.
+	if !strings.Contains(got, "JS-событие") || !strings.Contains(got, "посещение страницы") {
+		t.Errorf("goal types were not translated:\n%s", got)
+	}
+	// A ready-to-paste rule removes the last step of guesswork.
+	if !strings.Contains(got, "| goal:42 | drop |") {
+		t.Errorf("no example rule to copy:\n%s", got)
+	}
+}
+
+// The usual failure is a token without access to the counter's settings. That
+// must not read as "the feature is broken".
+func TestListGoalsExplainsAccessFailure(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{err: fmt.Errorf("metrika API 403: Access denied")}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	got := tr.last()
+	if !strings.Contains(got, "OAuth-токен") {
+		t.Errorf("the reply does not point at the likely cause:\n%s", got)
+	}
+	// Goal alerts still work without management access; say so.
+	if !strings.Contains(got, "всё равно работают") {
+		t.Errorf("the reply does not say alerts still work:\n%s", got)
+	}
+}
+
+func TestListGoalsWithNoneConfigured(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/goals 1")
+
+	if got := tr.last(); !strings.Contains(got, "нет настроенных целей") {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestListGoalsNeedsAKnownCounter(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+
+	say(t, b, "/goals 99")
+	if got := tr.last(); !strings.Contains(got, "не найден") {
+		t.Errorf("got %q", got)
+	}
+
+	say(t, b, "/goals")
+	if got := tr.last(); !strings.Contains(got, "ID") {
+		t.Errorf("got %q", got)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/isklv/metrika-alert/internal/engine"
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
@@ -33,6 +34,12 @@ type Message struct {
 	Text   string
 }
 
+// MetrikaLookup answers questions about a counter's configuration in Metrika.
+// The bot only reads; it never changes anything there.
+type MetrikaLookup interface {
+	Goals(ctx context.Context, counter *model.Counter) ([]engine.Goal, error)
+}
+
 // Tasks runs the background jobs the bot can trigger on demand.
 type Tasks interface {
 	// RunReport builds and delivers a report; counterID 0 means every counter.
@@ -46,6 +53,7 @@ type Bot struct {
 	db        *model.DB
 	transport Transport
 	tasks     Tasks
+	metrika   MetrikaLookup
 	admins    map[string]bool
 
 	mu      sync.Mutex
@@ -54,7 +62,7 @@ type Bot struct {
 
 // New builds a bot. adminIDs are the users allowed to configure the service;
 // an empty list locks the bot down rather than opening it to everyone.
-func New(transport Transport, db *model.DB, tasks Tasks, adminIDs []string) *Bot {
+func New(transport Transport, db *model.DB, tasks Tasks, metrika MetrikaLookup, adminIDs []string) *Bot {
 	admins := make(map[string]bool, len(adminIDs))
 	for _, id := range adminIDs {
 		if id = strings.TrimSpace(id); id != "" {
@@ -65,6 +73,7 @@ func New(transport Transport, db *model.DB, tasks Tasks, adminIDs []string) *Bot
 		db:        db,
 		transport: transport,
 		tasks:     tasks,
+		metrika:   metrika,
 		admins:    admins,
 		pending:   make(map[string]*pendingAction),
 	}
@@ -116,6 +125,8 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		b.promptAddCounter(ctx, msg)
 	case "deletecounter":
 		b.deleteCounter(ctx, msg.ChatID, args)
+	case "goals":
+		b.listGoals(ctx, msg.ChatID, args)
 	case "triggers":
 		b.listTriggers(ctx, msg.ChatID, args)
 	case "addtrigger":

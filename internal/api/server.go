@@ -18,10 +18,16 @@ import (
 )
 
 // Server exposes REST endpoints for managing counters, monitors, triggers, alerts.
+// MetrikaLookup reads a counter's configuration from Metrika.
+type MetrikaLookup interface {
+	Goals(ctx context.Context, counter *model.Counter) ([]engine.Goal, error)
+}
+
 type Server struct {
 	db        *model.DB
 	reporter  *engine.Reporter
 	poller    *engine.Poller
+	lookup    MetrikaLookup
 	metrika   *engine.MetrikaConfig
 	mux       *http.ServeMux
 	listen    string
@@ -36,11 +42,12 @@ type Config struct {
 	Metrika    *engine.MetrikaConfig
 }
 
-func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, cfg Config) *Server {
+func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, lookup MetrikaLookup, cfg Config) *Server {
 	s := &Server{
 		db:        db,
 		reporter:  reporter,
 		poller:    poller,
+		lookup:    lookup,
 		metrika:   cfg.Metrika,
 		listen:    cfg.ListenAddr,
 		authToken: cfg.AuthToken,
@@ -80,6 +87,7 @@ func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/counters", s.withAuth(s.handleCounters))
+	s.mux.HandleFunc("/api/goals", s.withAuth(s.handleGoals))
 	s.mux.HandleFunc("/api/triggers", s.withAuth(s.handleTriggers))
 	s.mux.HandleFunc("/api/alert-actions", s.withAuth(s.handleAlertActions))
 	s.mux.HandleFunc("/api/alerts", s.withAuth(s.handleAlerts))
@@ -171,6 +179,38 @@ func (s *Server) createCounter(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(c)
+}
+
+// handleGoals lists a counter's conversion goals, so a caller can discover the
+// IDs that rules address as goal:<id>.
+func (s *Server) handleGoals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
+	if counterID <= 0 {
+		http.Error(w, "counter_id required", http.StatusBadRequest)
+		return
+	}
+	counter, err := s.db.GetCounter(r.Context(), counterID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if s.lookup == nil {
+		http.Error(w, "goal lookup is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	goals, err := s.lookup.Goals(r.Context(), counter)
+	if err != nil {
+		// The counter's token may lack access to its settings; that is a
+		// configuration answer, not a server fault.
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	s.getJSON(w, goals, nil)
 }
 
 func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request) {

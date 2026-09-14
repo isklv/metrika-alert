@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,6 +14,16 @@ import (
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
+// fakeLookup stands in for the counter-configuration lookup.
+type fakeLookup struct {
+	goals []engine.Goal
+	err   error
+}
+
+func (f *fakeLookup) Goals(context.Context, *model.Counter) ([]engine.Goal, error) {
+	return f.goals, f.err
+}
+
 func testServer(t *testing.T, authToken string) (*Server, *model.DB) {
 	t.Helper()
 	db, err := model.OpenDB(filepath.Join(t.TempDir(), "api.db"))
@@ -22,7 +33,7 @@ func testServer(t *testing.T, authToken string) (*Server, *model.DB) {
 	t.Cleanup(func() { db.Close() })
 
 	metrika := &engine.MetrikaConfig{BaseURL: "https://api.example"}
-	s := NewServer(db, engine.NewReporter(db, metrika, nil), engine.NewPoller(db, metrika, nil), Config{
+	s := NewServer(db, engine.NewReporter(db, metrika, nil), engine.NewPoller(db, metrika, nil), &fakeLookup{}, Config{
 		ListenAddr: ":0",
 		AuthToken:  authToken,
 		Metrika:    metrika,
@@ -225,5 +236,48 @@ func TestCreateTriggerRejectsBadScope(t *testing.T) {
 
 	if triggers, _ := db.ListTriggers(context.Background(), 1); len(triggers) != 0 {
 		t.Errorf("a rejected scope created %d rule(s)", len(triggers))
+	}
+}
+
+func TestGoalsEndpoint(t *testing.T) {
+	s, db := testServer(t, "")
+	if err := db.CreateCounter(context.Background(), &model.Counter{
+		Name: "n", CounterID: "1", OAuthToken: "t", PollInterval: 60,
+	}); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	s.lookup = &fakeLookup{goals: []engine.Goal{{ID: 42, Name: "Покупка", Type: "action"}}}
+
+	w := do(s, http.MethodGet, "/api/goals?counter_id=1", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body)
+	}
+	for _, want := range []string{`"id":42`, "Покупка", `"type":"action"`} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("body is missing %q: %s", want, w.Body.String())
+		}
+	}
+}
+
+func TestGoalsEndpointErrors(t *testing.T) {
+	s, db := testServer(t, "")
+	if err := db.CreateCounter(context.Background(), &model.Counter{
+		Name: "n", CounterID: "1", OAuthToken: "t", PollInterval: 60,
+	}); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+
+	if w := do(s, http.MethodGet, "/api/goals", "", ""); w.Code != http.StatusBadRequest {
+		t.Errorf("no counter_id: status = %d, want 400", w.Code)
+	}
+	if w := do(s, http.MethodGet, "/api/goals?counter_id=99", "", ""); w.Code != http.StatusNotFound {
+		t.Errorf("unknown counter: status = %d, want 404", w.Code)
+	}
+
+	// A token without access to the counter's settings is a configuration
+	// answer, not a server fault.
+	s.lookup = &fakeLookup{err: fmt.Errorf("metrika API 403: Access denied")}
+	if w := do(s, http.MethodGet, "/api/goals?counter_id=1", "", ""); w.Code != http.StatusBadGateway {
+		t.Errorf("denied access: status = %d, want 502", w.Code)
 	}
 }

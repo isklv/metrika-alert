@@ -16,6 +16,7 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /addcounter — добавить счётчик Метрики
 /deletecounter <id> — удалить счётчик
 
+/goals <counter_id> — цели счётчика и их ID
 /triggers <counter_id> — правила алертов
 /addtrigger <counter_id> — создать триггер
 /deletetrigger <id> — удалить триггер
@@ -68,6 +69,57 @@ func (b *Bot) deleteCounter(ctx context.Context, chatID, args string) {
 		return
 	}
 	b.reply(ctx, chatID, fmt.Sprintf("✅ Счётчик *%s* удалён вместе с его правилами и историей", c.Name))
+}
+
+// ---- Goals ----
+
+// listGoals answers the question a rule cannot: which goal IDs exist. Writing
+// `goal:42` requires knowing that 42 is the order confirmation, and that number
+// lives only in Metrika.
+func (b *Bot) listGoals(ctx context.Context, chatID, args string) {
+	id, ok := b.parseID(ctx, chatID, args, "/goals 1")
+	if !ok {
+		return
+	}
+	counter, err := b.db.GetCounter(ctx, id)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ Счётчик не найден. Список: /counters")
+		return
+	}
+
+	if b.metrika == nil {
+		b.reply(ctx, chatID, "❌ Справочник целей недоступен: движок не подключён.")
+		return
+	}
+
+	goals, err := b.metrika.Goals(ctx, counter)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ Не удалось получить цели: "+err.Error()+
+			"\n\nЧаще всего это значит, что OAuth-токен счётчика не даёт доступа к его настройкам. "+
+			"Алерты по `goals` и по конкретной цели всё равно работают — ID цели можно взять в интерфейсе Метрики.")
+		return
+	}
+	if len(goals) == 0 {
+		b.reply(ctx, chatID, "У счётчика *"+counter.Name+"* нет настроенных целей.")
+		return
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "*Цели — %s:*\n\n", counter.Name)
+	for _, g := range goals {
+		mark := ""
+		if g.IsFavorite {
+			mark = "⭐ "
+		}
+		if !g.Active() {
+			mark = "⛔ "
+		}
+		fmt.Fprintf(&sb, "• %s*%s* — `goal:%d`\n    %s\n", mark, g.Name, g.ID, g.TypeLabel())
+	}
+	sb.WriteString("\nПравило по цели:\n`Заказы просели | goal:" +
+		strconv.FormatInt(goals[0].ID, 10) + " | drop | 50`")
+
+	b.reply(ctx, chatID, sb.String())
 }
 
 // ---- Triggers ----

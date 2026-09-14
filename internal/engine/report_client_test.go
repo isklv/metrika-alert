@@ -158,3 +158,62 @@ func TestSummaryMetricsOrderMatchesAccessors(t *testing.T) {
 		t.Errorf("SummaryMetrics = %v", SummaryMetrics)
 	}
 }
+
+func TestGoalTypeLabel(t *testing.T) {
+	tests := map[string]string{
+		"action":         "JS-событие",
+		"url":            "посещение страницы",
+		"visit_duration": "время на сайте",
+		"step":           "составная цель",
+		// An undocumented type must show itself rather than vanish.
+		"brand_new": "brand_new",
+		"":          "цель",
+	}
+	for goalType, want := range tests {
+		if got := (Goal{Type: goalType}).TypeLabel(); got != want {
+			t.Errorf("TypeLabel(%q) = %q, want %q", goalType, got, want)
+		}
+	}
+}
+
+// The API does not document its status values, so only an explicit "Deleted"
+// counts as inactive — guessing the other way would hide real goals.
+func TestGoalActive(t *testing.T) {
+	for _, status := range []string{"", "Active", "active", "Something"} {
+		if !(Goal{Status: status}).Active() {
+			t.Errorf("status %q should count as active", status)
+		}
+	}
+	for _, status := range []string{"Deleted", "deleted"} {
+		if (Goal{Status: status}).Active() {
+			t.Errorf("status %q should count as inactive", status)
+		}
+	}
+}
+
+func TestGoalsDecodesFullObject(t *testing.T) {
+	var got *http.Request
+	c := reportStub(t, `{"goals":[
+		{"id":42,"name":"Покупка","type":"action","status":"Active","is_favorite":true,"default_price":100.5},
+		{"id":77,"name":"Просмотр","type":"url","status":"Active"}]}`, &got)
+
+	goals, err := c.Goals(context.Background())
+	if err != nil {
+		t.Fatalf("Goals: %v", err)
+	}
+	if got.URL.Path != "/management/v1/counter/12345678/goals" {
+		t.Errorf("path = %q", got.URL.Path)
+	}
+	if len(goals) != 2 {
+		t.Fatalf("got %d goals", len(goals))
+	}
+	if goals[0].ID != 42 || goals[0].Name != "Покупка" || goals[0].Type != "action" {
+		t.Errorf("goal = %+v", goals[0])
+	}
+	if !goals[0].IsFavorite {
+		t.Error("is_favorite was lost")
+	}
+	if !goals[0].Active() {
+		t.Error("an Active goal read as inactive")
+	}
+}
