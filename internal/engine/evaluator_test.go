@@ -486,3 +486,143 @@ func TestCoarsenedSeriesIsRefused(t *testing.T) {
 		t.Errorf("error should name the resolution mismatch: %v", err)
 	}
 }
+
+// ---- URL scoping ----
+
+// The filter must reach the API verbatim, or the rule silently measures the
+// whole site while claiming to watch one page.
+func TestURLScopedRuleSendsTheFilter(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 20})}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Чекаут просел", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+		URLFilter: "/checkout", URLMatch: URLMatchContains,
+	})
+
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateWindow: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("fired = %d, want 1", fired)
+	}
+
+	if got := fake.lastRequest().Get("filters"); got != `EXISTS(ym:pv:URL=@'/checkout')` {
+		t.Errorf("filters = %q", got)
+	}
+	// The scope belongs in the alert: otherwise two rules on the same metric
+	// produce indistinguishable messages.
+	if msg := h.router.last().message; !strings.Contains(msg, "/checkout") {
+		t.Errorf("alert does not name the scope:\n%s", msg)
+	}
+}
+
+// A rule without a scope must not send an empty filters parameter.
+func TestUnscopedRuleSendsNoFilter(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateWindow: %v", err)
+	}
+	if _, present := fake.lastRequest()["filters"]; present {
+		t.Errorf("an unscoped rule sent filters=%q", fake.lastRequest().Get("filters"))
+	}
+}
+
+// A filter applies to the whole request, so rules watching different pages need
+// separate ones — while rules sharing a scope must still share a request.
+func TestRulesGroupIntoOneRequestPerScope(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+
+	// Two rules on /checkout, one on /catalog, one counter-wide.
+	h.addTrigger(t, &model.Trigger{
+		Name: "Чекаут визиты", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180, URLFilter: "/checkout", URLMatch: URLMatchContains,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Чекаут цели", Metric: "goal:42", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180, URLFilter: "/checkout", URLMatch: URLMatchContains,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Каталог", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180, URLFilter: "/catalog", URLMatch: URLMatchContains,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Весь сайт", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateWindow: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.requests) != 3 {
+		t.Fatalf("made %d requests for 3 distinct scopes", len(fake.requests))
+	}
+
+	seen := map[string]string{}
+	for _, q := range fake.requests {
+		seen[q.Get("filters")] = q.Get("metrics")
+	}
+	// The two /checkout rules shared one request, so it carries both metrics.
+	checkout, ok := seen[`EXISTS(ym:pv:URL=@'/checkout')`]
+	if !ok {
+		t.Fatalf("no request for the /checkout scope: %v", seen)
+	}
+	for _, want := range []string{"ym:s:visits", "ym:s:goal42reaches"} {
+		if !strings.Contains(checkout, want) {
+			t.Errorf("the /checkout request is missing %s: %q", want, checkout)
+		}
+	}
+}
+
+// One unusable scope must not stop the counter's other rules.
+func TestBadScopeDoesNotStopOtherRules(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, map[time.Time]float64{tuesday3pm: 20})}
+	h := newEvalHarness(t, fake)
+
+	h.addTrigger(t, &model.Trigger{
+		Name: "Сломанная", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+		URLFilter: "^/catalog/[", URLMatch: URLMatchRegexp,
+	})
+	h.addTrigger(t, &model.Trigger{
+		Name: "Рабочая", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+	})
+
+	fired, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm)
+	if err != nil {
+		t.Fatalf("EvaluateWindow: %v", err)
+	}
+	if fired != 1 {
+		t.Errorf("fired = %d, want the working rule to still fire", fired)
+	}
+}
+
+// A regexp scope travels with its own operator.
+func TestRegexpScopeUsesRegexpOperator(t *testing.T) {
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	h := newEvalHarness(t, fake)
+	h.addTrigger(t, &model.Trigger{
+		Name: "Каталог", Metric: "visits", Direction: DirectionDrop,
+		DeviationPct: 40, MinBaseline: 10, Cooldown: 180,
+		URLFilter: `^/catalog/\d+`, URLMatch: URLMatchRegexp,
+	})
+
+	if _, err := h.evaluator.EvaluateWindow(context.Background(), h.counter, tuesday3pm); err != nil {
+		t.Fatalf("EvaluateWindow: %v", err)
+	}
+	if got := fake.lastRequest().Get("filters"); !strings.Contains(got, "=~") {
+		t.Errorf("filters = %q, want the regexp operator", got)
+	}
+}

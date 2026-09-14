@@ -40,10 +40,15 @@ type Trigger struct {
 	// on, because one visit fewer out of two is a 50% drop and means nothing.
 	MinBaseline int `json:"min_baseline"`
 	// BaselineWeeks is how many earlier occurrences of the slot form the baseline.
-	BaselineWeeks int       `json:"baseline_weeks"`
-	Cooldown      int       `json:"cooldown_minutes"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
+	BaselineWeeks int `json:"baseline_weeks"`
+	// URLFilter narrows the rule to sessions that touched a matching page.
+	// Empty means the whole counter.
+	URLFilter string `json:"url_filter,omitempty"`
+	// URLMatch is how URLFilter is compared: "contains" or "regexp".
+	URLMatch  string    `json:"url_match,omitempty"`
+	Cooldown  int       `json:"cooldown_minutes"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Alert is a fired notification.

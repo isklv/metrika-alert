@@ -94,10 +94,11 @@ func (b *Bot) listTriggers(ctx context.Context, chatID, args string) {
 		sb.WriteString(fmt.Sprintf("_Нет триггеров. Добавь: /addtrigger %d_", id))
 	} else {
 		for _, t := range triggers {
-			sb.WriteString(fmt.Sprintf("• #%d %s *%s*\n    %s %s на %d%%+ от обычного для этого часа\n    база %d нед., мин. %d, кулдаун %d мин\n",
+			sb.WriteString(fmt.Sprintf("• #%d %s *%s*\n    %s %s на %d%%+ от обычного для этого времени\n    область: %s\n    база %d нед., мин. %d, кулдаун %d мин\n",
 				t.ID, enabledMark(t.Enabled), t.Name,
-				engine.MetricLabel(t.Metric), directionLabel(t.Direction),
-				t.DeviationPct, t.BaselineWeeks, t.MinBaseline, t.Cooldown))
+				engine.MetricLabel(t.Metric), directionLabel(t.Direction), t.DeviationPct,
+				engine.URLFilterLabel(t.URLFilter, t.URLMatch),
+				t.BaselineWeeks, t.MinBaseline, t.Cooldown))
 		}
 	}
 	b.reply(ctx, chatID, sb.String())

@@ -276,3 +276,120 @@ func TestCommandFromNonAdminIsRefused(t *testing.T) {
 		t.Errorf("got %q", tr.last())
 	}
 }
+
+// ---- URL scoping in the rule syntax ----
+
+func TestAddTriggerWithURLScope(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Чекаут просел | visits | drop | 40 | url=/checkout")
+
+	triggers, err := db.ListTriggers(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ListTriggers: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers, want 1", len(triggers))
+	}
+
+	got := triggers[0]
+	if got.URLFilter != "/checkout" {
+		t.Errorf("url_filter = %q", got.URLFilter)
+	}
+	if got.URLMatch != "contains" {
+		t.Errorf("url_match = %q, want contains", got.URLMatch)
+	}
+	// The labelled field must not be mistaken for the positional numbers.
+	if got.MinBaseline != 10 || got.BaselineWeeks != 4 {
+		t.Errorf("defaults were consumed by the url field: %+v", got)
+	}
+}
+
+func TestAddTriggerWithRegexpScope(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, `Каталог | visits | drop | 35 | url~^/catalog/\d+`)
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	if triggers[0].URLMatch != "regexp" {
+		t.Errorf("url_match = %q, want regexp", triggers[0].URLMatch)
+	}
+	if triggers[0].URLFilter != `^/catalog/\d+` {
+		t.Errorf("url_filter = %q", triggers[0].URLFilter)
+	}
+}
+
+// The scope may follow the optional numbers as well as replace them.
+func TestAddTriggerWithScopeAfterOptionalNumbers(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Чекаут | goal:42 | drop | 50 | 5 | 6 | url=/checkout")
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	got := triggers[0]
+	if got.MinBaseline != 5 || got.BaselineWeeks != 6 {
+		t.Errorf("positional numbers were misread: %+v", got)
+	}
+	if got.URLFilter != "/checkout" {
+		t.Errorf("url_filter = %q", got.URLFilter)
+	}
+}
+
+// Rules written before URL scoping existed must keep working unchanged.
+func TestAddTriggerWithoutScopeStillWorks(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, "Визиты | visits | drop | 40 | 20 | 8")
+
+	triggers, _ := db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 1 {
+		t.Fatalf("got %d triggers", len(triggers))
+	}
+	got := triggers[0]
+	if got.URLFilter != "" || got.URLMatch != "" {
+		t.Errorf("an unscoped rule gained a scope: %+v", got)
+	}
+	if got.MinBaseline != 20 || got.BaselineWeeks != 8 {
+		t.Errorf("rule = %+v", got)
+	}
+}
+
+func TestAddTriggerRejectsBadScope(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+	say(t, b, "/addtrigger 1")
+
+	for _, bad := range []string{
+		"Каталог | visits | drop | 40 | url~^/catalog/[", // uncompilable regexp
+		"Каталог | visits | drop | 40 | url=",            // empty pattern
+		"Каталог | visits | drop | 40 | url=/a | url=/b", // two scopes
+	} {
+		say(t, b, bad)
+		if last := tr.last(); !strings.Contains(last, "❌") && !strings.Contains(last, "url") {
+			t.Errorf("input %q: expected a validation message, got %q", bad, last)
+		}
+	}
+
+	if triggers, _ := db.ListTriggers(context.Background(), 1); len(triggers) != 0 {
+		t.Fatalf("a malformed scope created %d rule(s)", len(triggers))
+	}
+}

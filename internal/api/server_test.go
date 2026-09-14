@@ -175,3 +175,55 @@ func TestEmptyListsAreArraysNotNull(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateTriggerWithURLScope(t *testing.T) {
+	s, db := testServer(t, "")
+	if err := db.CreateCounter(context.Background(), &model.Counter{
+		Name: "n", CounterID: "1", OAuthToken: "t", PollInterval: 60,
+	}); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+
+	w := do(s, http.MethodPost, "/api/triggers",
+		`{"counter_id":1,"name":"Чекаут","metric":"visits","direction":"drop","deviation_percent":40,"url_filter":"/checkout"}`, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", w.Code, w.Body)
+	}
+
+	var got model.Trigger
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.URLFilter != "/checkout" {
+		t.Errorf("url_filter = %q", got.URLFilter)
+	}
+	// An omitted url_match defaults to substring rather than failing.
+	if got.URLMatch != "contains" {
+		t.Errorf("url_match = %q, want contains", got.URLMatch)
+	}
+}
+
+func TestCreateTriggerRejectsBadScope(t *testing.T) {
+	s, db := testServer(t, "")
+	if err := db.CreateCounter(context.Background(), &model.Counter{
+		Name: "n", CounterID: "1", OAuthToken: "t", PollInterval: 60,
+	}); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+
+	tests := map[string]string{
+		"unknown match": `{"counter_id":1,"name":"X","metric":"visits","deviation_percent":40,"url_filter":"/a","url_match":"glob"}`,
+		"broken regexp": `{"counter_id":1,"name":"X","metric":"visits","deviation_percent":40,"url_filter":"^/a[","url_match":"regexp"}`,
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			if w := do(s, http.MethodPost, "/api/triggers", body, ""); w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400: %s", w.Code, w.Body)
+			}
+		})
+	}
+
+	if triggers, _ := db.ListTriggers(context.Background(), 1); len(triggers) != 0 {
+		t.Errorf("a rejected scope created %d rule(s)", len(triggers))
+	}
+}

@@ -141,32 +141,45 @@ func (b *Bot) promptAddTrigger(ctx context.Context, msg Message, args string) {
 	b.setPending(msg.UserID, &pendingAction{kind: actionAddTrigger, chatID: msg.ChatID, counterID: counterID})
 	b.reply(ctx, msg.ChatID, `Пришли правило одним сообщением:
 
-`+"`имя | метрика | направление | порог% [мин_база] [недель]`"+`
+`+"`имя | метрика | направление | порог% [мин_база] [недель] [url=...]`"+`
 
 Метрики: `+"`visits`"+`, `+"`users`"+`, `+"`pageviews`"+`, `+"`goals`"+`, `+"`goal:42`"+`
 Направление: `+"`drop`"+` (падение), `+"`rise`"+` (рост), `+"`both`"+`
 
 Примеры:
 `+"`Визиты упали | visits | drop | 40`"+`
+`+"`Чекаут просел | visits | drop | 40 | url=/checkout`"+`
 `+"`Заказы просели | goal:42 | drop | 50 | 5 | 4`"+`
+`+"`Каталог | visits | drop | 35 | url~^/catalog/\\d+`"+`
 
-Сравнение идёт с тем же часом того же дня недели за прошлые недели: вторник
-15:00 — с прошлыми вторниками в 15:00. `+"`мин_база`"+` — ниже какого обычного
-значения не тревожить (по умолчанию 10), `+"`недель`"+` — сколько недель истории
-брать (по умолчанию 4).`)
+`+"`url=`"+` — URL содержит подстроку, `+"`url~`"+` — регулярное выражение.
+Считаются сессии, в которых была хотя бы одна такая страница.
+
+Сравнение идёт с тем же временем того же дня недели за прошлые недели.
+`+"`мин_база`"+` — ниже какого обычного значения не тревожить (по умолчанию 10),
+`+"`недель`"+` — сколько недель истории брать (по умолчанию 4).`)
 }
 
 // saveTrigger parses the pipe-delimited rule. The separator matters because the
 // name may contain spaces and "goal:42" may not be split on anything else.
 func (b *Bot) saveTrigger(ctx context.Context, p *pendingAction, text string) bool {
 	fields := strings.Split(text, "|")
-	if len(fields) < 4 || len(fields) > 6 {
-		b.reply(ctx, p.chatID, "Неверный формат. Нужно от четырёх до шести частей через `|`:\n`имя | метрика | направление | порог% [мин_база] [недель]`")
+	if len(fields) < 4 || len(fields) > 7 {
+		b.reply(ctx, p.chatID, "Неверный формат. Нужно от четырёх до семи частей через `|`:\n`имя | метрика | направление | порог% [мин_база] [недель] [url=...]`")
 		return false
 	}
 	for i := range fields {
 		fields[i] = strings.TrimSpace(fields[i])
 	}
+
+	// The URL scope is labelled rather than positional, so it can follow the
+	// threshold directly without forcing the optional numbers to be typed.
+	urlFilter, urlMatch, rest, err := takeURLScope(fields[4:])
+	if err != nil {
+		b.reply(ctx, p.chatID, "❌ "+err.Error())
+		return false
+	}
+	optional := rest
 
 	name := fields[0]
 	if name == "" {
@@ -186,28 +199,32 @@ func (b *Bot) saveTrigger(ctx context.Context, p *pendingAction, text string) bo
 		return false
 	}
 
-	deviation, err := strconv.Atoi(strings.TrimSuffix(fields[3], "%"))
-	if err != nil || deviation <= 0 || deviation > 100 {
+	deviation, convErr := strconv.Atoi(strings.TrimSuffix(fields[3], "%"))
+	if convErr != nil || deviation <= 0 || deviation > 100 {
 		b.reply(ctx, p.chatID, "Порог — целое число процентов от 1 до 100, например `40`.")
 		return false
 	}
 
 	minBaseline := defaultMinBaseline
-	if len(fields) >= 5 && fields[4] != "" {
-		minBaseline, err = strconv.Atoi(fields[4])
-		if err != nil || minBaseline < 0 {
+	if len(optional) >= 1 && optional[0] != "" {
+		minBaseline, convErr = strconv.Atoi(optional[0])
+		if convErr != nil || minBaseline < 0 {
 			b.reply(ctx, p.chatID, "`мин_база` — неотрицательное целое число.")
 			return false
 		}
 	}
 
 	weeks := defaultBaselineWeeks
-	if len(fields) == 6 && fields[5] != "" {
-		weeks, err = strconv.Atoi(fields[5])
-		if err != nil || weeks < 1 || weeks > maxBaselineWeeks {
+	if len(optional) >= 2 && optional[1] != "" {
+		weeks, convErr = strconv.Atoi(optional[1])
+		if convErr != nil || weeks < 1 || weeks > maxBaselineWeeks {
 			b.reply(ctx, p.chatID, fmt.Sprintf("`недель` — целое число от 1 до %d.", maxBaselineWeeks))
 			return false
 		}
+	}
+	if len(optional) > 2 {
+		b.reply(ctx, p.chatID, "Лишние поля после `недель`. Фильтр по URL пишется как `url=/checkout` или `url~^/catalog/`.")
+		return false
 	}
 
 	trigger := &model.Trigger{
@@ -218,6 +235,8 @@ func (b *Bot) saveTrigger(ctx context.Context, p *pendingAction, text string) bo
 		DeviationPct:  deviation,
 		MinBaseline:   minBaseline,
 		BaselineWeeks: weeks,
+		URLFilter:     urlFilter,
+		URLMatch:      urlMatch,
 		Cooldown:      defaultCooldownMinutes,
 		Enabled:       true,
 	}
@@ -227,10 +246,53 @@ func (b *Bot) saveTrigger(ctx context.Context, p *pendingAction, text string) bo
 	}
 
 	b.reply(ctx, p.chatID, fmt.Sprintf(
-		"✅ Правило #%d *%s* создано\n%s %s на %d%%+ от обычного для этого часа\nБаза: медиана %d недель, не тревожить ниже %d, кулдаун %d мин",
+		"✅ Правило #%d *%s* создано\n%s %s на %d%%+ от обычного для этого времени\nОбласть: %s\nБаза: медиана %d недель, не тревожить ниже %d, кулдаун %d мин",
 		trigger.ID, name, engine.MetricLabel(metric), directionLabel(direction),
-		deviation, weeks, minBaseline, defaultCooldownMinutes))
+		deviation, engine.URLFilterLabel(urlFilter, urlMatch), weeks, minBaseline, defaultCooldownMinutes))
 	return true
+}
+
+// takeURLScope pulls a labelled url= or url~ field out of the optional tail and
+// returns it along with the fields that remain positional.
+func takeURLScope(optional []string) (filter, match string, rest []string, err error) {
+	for _, field := range optional {
+		value, isRegexp, ok := parseURLScope(field)
+		if !ok {
+			rest = append(rest, field)
+			continue
+		}
+		if filter != "" {
+			return "", "", nil, fmt.Errorf("фильтр по URL указан дважды")
+		}
+		if value == "" {
+			return "", "", nil, fmt.Errorf("после `url=` нужен непустой шаблон")
+		}
+		filter = value
+		match = engine.URLMatchContains
+		if isRegexp {
+			match = engine.URLMatchRegexp
+		}
+	}
+
+	if filter != "" {
+		// Reject a bad pattern here, where the message can name the field,
+		// rather than at the first check hours later.
+		if _, err := engine.URLFilter(filter, match); err != nil {
+			return "", "", nil, err
+		}
+	}
+	return filter, match, rest, nil
+}
+
+// parseURLScope recognises "url=<substring>" and "url~<regexp>".
+func parseURLScope(field string) (value string, isRegexp, ok bool) {
+	if v, found := strings.CutPrefix(field, "url~"); found {
+		return strings.TrimSpace(v), true, true
+	}
+	if v, found := strings.CutPrefix(field, "url="); found {
+		return strings.TrimSpace(v), false, true
+	}
+	return "", false, false
 }
 
 // ---- add alert action ----

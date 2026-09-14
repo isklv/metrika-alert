@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -49,30 +50,94 @@ func (e *Evaluator) EvaluateWindow(ctx context.Context, counter *model.Counter, 
 		return 0, nil
 	}
 
-	series, index, err := e.fetchSeries(ctx, counter, enabled, end)
+	// A filter applies to the whole request, so rules watching different pages
+	// cannot share one. Rules that watch the same scope still do.
+	groups, err := groupByScope(enabled)
 	if err != nil {
 		return 0, err
 	}
 
 	var fired int
-	for _, t := range enabled {
-		delivered, err := e.evaluateTrigger(ctx, counter, &t, series, index, end)
+	var firstErr error
+	for _, scope := range groups {
+		series, index, err := e.fetchSeries(ctx, counter, scope.triggers, end, scope.filter)
 		if err != nil {
-			log.Printf("counter %s: trigger %d (%s): %v", counter.CounterID, t.ID, t.Name, err)
+			log.Printf("counter %s: scope %q: %v", counter.CounterID, scope.label(), err)
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
-		if delivered {
-			fired++
+
+		for _, t := range scope.triggers {
+			delivered, err := e.evaluateTrigger(ctx, counter, &t, series, index, end)
+			if err != nil {
+				log.Printf("counter %s: trigger %d (%s): %v", counter.CounterID, t.ID, t.Name, err)
+				continue
+			}
+			if delivered {
+				fired++
+			}
 		}
 	}
+
+	// Every scope failing means the window was not judged at all; the caller
+	// must not advance its cursor past it.
+	if fired == 0 && firstErr != nil {
+		return 0, firstErr
+	}
 	return fired, nil
+}
+
+// scope is a set of rules that share one API request because they watch the
+// same pages.
+type scope struct {
+	filter   string
+	triggers []model.Trigger
+}
+
+func (s scope) label() string {
+	if s.filter == "" {
+		return "весь счётчик"
+	}
+	return s.filter
+}
+
+// groupByScope buckets rules by the filter they need, in a stable order so
+// logs and tests read the same way every run.
+func groupByScope(triggers []model.Trigger) ([]scope, error) {
+	byFilter := make(map[string][]model.Trigger)
+	for _, t := range triggers {
+		filter, err := URLFilter(t.URLFilter, t.URLMatch)
+		if err != nil {
+			// One malformed rule must not take the counter's other rules down.
+			log.Printf("trigger %d (%s): %v", t.ID, t.Name, err)
+			continue
+		}
+		byFilter[filter] = append(byFilter[filter], t)
+	}
+	if len(byFilter) == 0 {
+		return nil, fmt.Errorf("no rule has a usable scope")
+	}
+
+	filters := make([]string, 0, len(byFilter))
+	for f := range byFilter {
+		filters = append(filters, f)
+	}
+	sort.Strings(filters)
+
+	out := make([]scope, 0, len(filters))
+	for _, f := range filters {
+		out = append(out, scope{filter: f, triggers: byFilter[f]})
+	}
+	return out, nil
 }
 
 // fetchSeries pulls the hourly history every trigger of this counter needs, in
 // one request. The window has to reach back far enough to hold the deepest
 // baseline any trigger asks for, and the metrics are deduplicated so a counter
 // with ten visit triggers still costs one call.
-func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, triggers []model.Trigger, end time.Time) (*TimeSeries, map[string]int, error) {
+func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, triggers []model.Trigger, end time.Time, filter string) (*TimeSeries, map[string]int, error) {
 	index := make(map[string]int)
 	var metrics []string
 	weeks := 1
@@ -103,8 +168,12 @@ func (e *Evaluator) fetchSeries(ctx context.Context, counter *model.Counter, tri
 	from := end.AddDate(0, 0, -7*weeks-1)
 	client := NewReportClient(counter, e.cfg.BaseURL)
 
-	series, err := client.FetchByTime(ctx, metrics,
-		from.Format("2006-01-02"), end.Format("2006-01-02"), GroupTenMinutes)
+	series, err := client.FetchByTime(ctx, Query{
+		Metrics: metrics,
+		Date1:   from.Format("2006-01-02"),
+		Date2:   end.Format("2006-01-02"),
+		Filters: filter,
+	}, GroupTenMinutes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -215,6 +284,9 @@ func (e *Evaluator) buildMessage(t *model.Trigger, v Verdict, end time.Time, win
 	start := end.Add(-window)
 
 	fmt.Fprintf(&b, "*Правило:* %s\n", t.Name)
+	if strings.TrimSpace(t.URLFilter) != "" {
+		fmt.Fprintf(&b, "*Область:* %s\n", URLFilterLabel(t.URLFilter, t.URLMatch))
+	}
 	fmt.Fprintf(&b, "*Окно:* %s–%s, %s\n",
 		start.Format("02.01 15:04"), end.Format("15:04"), weekdayName(end.Weekday()))
 	fmt.Fprintf(&b, "*%s:* %.0f\n", MetricLabel(t.Metric), v.Current)

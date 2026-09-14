@@ -206,6 +206,8 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 		DeviationPct  int    `json:"deviation_percent"`
 		MinBaseline   *int   `json:"min_baseline,omitempty"`
 		BaselineWeeks int    `json:"baseline_weeks"`
+		URLFilter     string `json:"url_filter"`
+		URLMatch      string `json:"url_match"`
 		Cooldown      int    `json:"cooldown_minutes"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -234,6 +236,18 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 	if body.BaselineWeeks <= 0 {
 		body.BaselineWeeks = defaultBaselineWeeks
 	}
+	if body.URLFilter != "" && body.URLMatch == "" {
+		body.URLMatch = engine.URLMatchContains
+	}
+	if !engine.ValidURLMatch(body.URLMatch) {
+		http.Error(w, "url_match must be contains or regexp", http.StatusBadRequest)
+		return
+	}
+	// Reject a bad pattern at creation, not at the first check hours later.
+	if _, err := engine.URLFilter(body.URLFilter, body.URLMatch); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if body.Cooldown <= 0 {
 		body.Cooldown = defaultCooldownMinutes
 	}
@@ -251,6 +265,8 @@ func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byt
 		DeviationPct:  body.DeviationPct,
 		MinBaseline:   minBaseline,
 		BaselineWeeks: body.BaselineWeeks,
+		URLFilter:     strings.TrimSpace(body.URLFilter),
+		URLMatch:      body.URLMatch,
 		Cooldown:      body.Cooldown,
 		Enabled:       true,
 	}

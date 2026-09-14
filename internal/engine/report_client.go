@@ -252,17 +252,16 @@ type byTimeResponse struct {
 
 // FetchByTime requests a time series at the given grouping.
 //
-// date1/date2 accept the API's own formats, so a caller can pass either
-// YYYY-MM-DD or a relative keyword.
-func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1, date2, group string) (*TimeSeries, error) {
-	if len(metrics) == 0 {
+// Query.Date1/Date2 accept the API's own formats, so a caller can pass either
+// YYYY-MM-DD or a relative keyword, and Query.Filters narrows the report.
+func (c *ReportClient) FetchByTime(ctx context.Context, q Query, group string) (*TimeSeries, error) {
+	if len(q.Metrics) == 0 {
 		return nil, fmt.Errorf("time series needs at least one metric")
 	}
-	if len(metrics) > 20 {
-		return nil, fmt.Errorf("time series has %d metrics, the API allows 20", len(metrics))
+	if len(q.Metrics) > 20 {
+		return nil, fmt.Errorf("time series has %d metrics, the API allows 20", len(q.Metrics))
 	}
 
-	q := Query{Metrics: metrics, Date1: date1, Date2: date2}
 	params := q.params(c.counterID)
 	if group == "" {
 		group = GroupHour
@@ -287,7 +286,7 @@ func (c *ReportClient) FetchByTime(ctx context.Context, metrics []string, date1,
 	if len(series.Intervals) == 0 {
 		// The field is not in the published schema, so the intervals are
 		// reconstructed from the request when the API omits them.
-		series.Intervals = deriveIntervals(date1, date2, groupStep(group), seriesLength(series.Values))
+		series.Intervals = deriveIntervals(q.Date1, q.Date2, groupStep(group), seriesLength(series.Values))
 	}
 	return series, nil
 }
