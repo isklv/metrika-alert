@@ -1,12 +1,22 @@
-.gitignore
-.woodpecker.yml
+# Only untracked, local artefacts belong here.
+#
+# Excluding a file that git tracks makes the checkout inside the image look
+# modified, and the binary then stamps itself +dirty on every build — which
+# turns the marker for "built from uncommitted changes" into noise.
+
+# Local runtime state and secrets, never committed.
+/config.yaml
+/.env
+/*.db
+/*.db-wal
+/*.db-shm
+
+# Build output.
 dist/
 build/
-metrika-alert
-*.db
-*.db-wal
-*.db-shm
-config.yaml
-README.md
-DEPLOY.md
-.env
+/metrika-alert
+
+# Editor state.
+.idea/
+.vscode/
+*.swp
