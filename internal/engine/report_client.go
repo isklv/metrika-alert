@@ -122,7 +122,9 @@ type Result struct {
 	Data      []Row     `json:"data"`
 	Totals    []float64 `json:"totals"`
 	TotalRows int       `json:"total_rows"`
-	Sampled   bool      `json:"sampled"`
+	// Read leniently: a surprise in this one field would otherwise fail the
+	// whole report, and alerting depends on it.
+	Sampled flexBool `json:"sampled"`
 }
 
 // Total returns the i-th total, or 0 when the response is shorter than asked.
@@ -155,12 +157,16 @@ func (c *ReportClient) Fetch(ctx context.Context, q Query) (*Result, error) {
 
 // Goal is a conversion goal configured on the counter.
 type Goal struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Status     string `json:"status"`
-	IsFavorite bool   `json:"is_favorite"`
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	// Metrika sends this as 0/1 despite documenting a boolean.
+	IsFavorite flexBool `json:"is_favorite"`
 }
+
+// Favorite reports whether the goal is starred in Metrika.
+func (g Goal) Favorite() bool { return bool(g.IsFavorite) }
 
 // Active reports whether the goal is still in use. The API does not document
 // the status values, so anything it does not explicitly mark as deleted counts
@@ -282,7 +288,7 @@ func (s *TimeSeries) Step() time.Duration {
 type byTimeResponse struct {
 	Totals        [][]float64 `json:"totals"`
 	TimeIntervals [][]string  `json:"time_intervals"`
-	Sampled       bool        `json:"sampled"`
+	Sampled       flexBool    `json:"sampled"`
 	Data          []struct {
 		Metrics [][]float64 `json:"metrics"`
 	} `json:"data"`
@@ -311,7 +317,7 @@ func (c *ReportClient) FetchByTime(ctx context.Context, q Query, group string) (
 		return nil, fmt.Errorf("fetch time series: %w", err)
 	}
 
-	series := &TimeSeries{Sampled: resp.Sampled}
+	series := &TimeSeries{Sampled: bool(resp.Sampled)}
 
 	// Prefer totals: with no dimensions requested it carries the whole series,
 	// and it is present whether or not the period produced grouped rows.

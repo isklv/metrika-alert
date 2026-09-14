@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,6 +65,21 @@ func (e *APIError) Error() string {
 		msg += ": " + strings.Join(e.Errors, "; ")
 	}
 	return fmt.Sprintf("metrika API %d: %s", e.StatusCode, msg)
+}
+
+// AccessDenied reports whether the API refused on credentials rather than on
+// the request itself.
+func (e *APIError) AccessDenied() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+}
+
+// IsAccessDenied reports whether err is the API refusing on credentials.
+// Callers use it to tell "your token lacks this permission" apart from every
+// other failure — blaming the token for, say, an unreadable response sends
+// people to fix something that was never wrong.
+func IsAccessDenied(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.AccessDenied()
 }
 
 // Retryable reports whether repeating the request could succeed. Quota and

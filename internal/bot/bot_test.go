@@ -441,7 +441,10 @@ func TestListGoalsShowsIDsAndUsage(t *testing.T) {
 // must not read as "the feature is broken".
 func TestListGoalsExplainsAccessFailure(t *testing.T) {
 	b, tr, _ := newTestBot(t, admin)
-	b.metrika = &fakeMetrika{err: fmt.Errorf("metrika API 403: Access denied")}
+	// The real client returns a wrapped *APIError, which is what the reply
+	// classifies on — a bare string would not be recognised as a refusal.
+	b.metrika = &fakeMetrika{err: fmt.Errorf("list goals: %w",
+		&engine.APIError{StatusCode: 403, Message: "Access denied"})}
 	say(t, b, "/addcounter")
 	say(t, b, "Магазин 12345678 y0_token")
 
@@ -451,8 +454,8 @@ func TestListGoalsExplainsAccessFailure(t *testing.T) {
 	if !strings.Contains(got, "OAuth-токен") {
 		t.Errorf("the reply does not point at the likely cause:\n%s", got)
 	}
-	// Goal alerts still work without management access; say so.
-	if !strings.Contains(got, "всё равно работают") {
+	// Goal alerts do not need management access; say so.
+	if !strings.Contains(got, "работают независимо") {
 		t.Errorf("the reply does not say alerts still work:\n%s", got)
 	}
 }
@@ -542,4 +545,36 @@ func TestMenuCommandsAreAllDispatched(t *testing.T) {
 	if !strings.Contains(menu, "/goals") {
 		t.Error("/goals is missing from the menu")
 	}
+}
+
+// Blaming the OAuth token for a decode failure sends people to fix something
+// that was never wrong — the message has to match the actual cause.
+func TestGoalsErrorBlamesTheTokenOnlyWhenRefused(t *testing.T) {
+	t.Run("access denied names the token", func(t *testing.T) {
+		b, tr, _ := newTestBot(t, admin)
+		b.metrika = &fakeMetrika{err: &engine.APIError{StatusCode: 403, Message: "Access denied"}}
+		say(t, b, "/addcounter")
+		say(t, b, "Магазин 12345678 y0_token")
+
+		say(t, b, "/goals 1")
+		if got := tr.last(); !strings.Contains(got, "OAuth-токен") {
+			t.Errorf("a refused request should name the token:\n%s", got)
+		}
+	})
+
+	t.Run("other failures do not", func(t *testing.T) {
+		b, tr, _ := newTestBot(t, admin)
+		b.metrika = &fakeMetrika{err: fmt.Errorf("decode response: json: cannot unmarshal number into bool")}
+		say(t, b, "/addcounter")
+		say(t, b, "Магазин 12345678 y0_token")
+
+		say(t, b, "/goals 1")
+		got := tr.last()
+		if strings.Contains(got, "OAuth-токен") {
+			t.Errorf("a decode failure was blamed on the token:\n%s", got)
+		}
+		if !strings.Contains(got, "cannot unmarshal") {
+			t.Errorf("the real error was not reported:\n%s", got)
+		}
+	})
 }
