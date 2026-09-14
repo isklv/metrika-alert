@@ -6,8 +6,9 @@ services:
     build:
       context: .
       args:
-        # Stamp the running build so /version and the startup log can name it.
-        VERSION: "${METRIKA_VERSION:-compose}"
+        # Left empty on purpose: the build then stamps itself with the commit
+        # it was built from. Set METRIKA_VERSION only to label a release.
+        VERSION: "${METRIKA_VERSION:-}"
     pull_policy: build
     container_name: metrika-alert
     restart: unless-stopped

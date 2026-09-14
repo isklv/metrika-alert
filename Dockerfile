@@ -6,15 +6,22 @@ FROM golang:1.25-bookworm AS builder
 
 WORKDIR /src
 # The module vendors its dependencies, so the build needs no network.
+# .git comes along deliberately: Go stamps the revision into the binary from
+# it, which is the only way a running container can say which build it is.
 COPY . .
 
-# The build context excludes .git, so Go cannot stamp the revision itself.
-# Passing it in is what lets a running container say which build it is —
-# without that, a stale image is indistinguishable from a missing feature.
-ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -mod=vendor \
-	-ldflags="-s -w -X main.version=${VERSION}" \
-	-o /metrika-alert ./cmd/server
+# The repository arrives owned by root from the build context; git refuses to
+# read it otherwise and the stamp would silently go missing.
+RUN git config --global --add safe.directory /src
+
+# VERSION overrides the stamp for tagged releases. Left unset, the binary
+# reports the commit it was built from, including a +dirty marker when the
+# tree had uncommitted changes.
+ARG VERSION=""
+RUN set -eu; \
+	ldflags="-s -w"; \
+	if [ -n "$VERSION" ]; then ldflags="$ldflags -X main.version=$VERSION"; fi; \
+	CGO_ENABLED=0 go build -mod=vendor -ldflags="$ldflags" -o /metrika-alert ./cmd/server
 
 FROM debian:bookworm-slim
 

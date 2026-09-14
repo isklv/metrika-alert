@@ -1,4 +1,3 @@
-.git
 .gitignore
 .woodpecker.yml
 dist/
@@ -10,3 +9,4 @@ metrika-alert
 config.yaml
 README.md
 DEPLOY.md
+.env

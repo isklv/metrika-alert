@@ -238,7 +238,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func newSupervisedPoller(t *testing.T) (*Poller, *model.DB) {
+// newSupervisedPoller returns a started-ready poller together with the context
+// that bounds it.
+//
+// Cleanups run last-registered-first, so the wait for polling goroutines to
+// stop is registered after the database close and therefore runs before it.
+// Closing the database while a goroutine is still writing leaves WAL files
+// behind and fails the temp-directory cleanup.
+func newSupervisedPoller(t *testing.T) (*Poller, *model.DB, context.Context) {
 	t.Helper()
 	db, err := model.OpenDB(filepath.Join(t.TempDir(), "supervise.db"))
 	if err != nil {
@@ -248,15 +255,20 @@ func newSupervisedPoller(t *testing.T) (*Poller, *model.DB) {
 
 	fake := &byTimeFake{value: steadyExcept(100, nil)}
 	cfg := &MetrikaConfig{BaseURL: fake.serve(t), SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}
-	return NewPoller(db, cfg, NewEvaluator(db, &fakeRouter{}, cfg)), db
+	p := NewPoller(db, cfg, NewEvaluator(db, &fakeRouter{}, cfg))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		waitFor(t, "polling goroutines to stop", func() bool { return p.Watched() == 0 })
+	})
+	return p, db, ctx
 }
 
 // The wart this replaces: a counter added through the bot was ignored until the
 // service was restarted.
 func TestCounterAddedAfterStartIsPickedUp(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, db, ctx := newSupervisedPoller(t)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -279,9 +291,7 @@ func TestCounterAddedAfterStartIsPickedUp(t *testing.T) {
 
 // A deleted counter used to leave its goroutine running and failing forever.
 func TestDeletedCounterStopsBeingPolled(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, db, ctx := newSupervisedPoller(t)
 
 	counter := testCounter()
 	if err := db.CreateCounter(ctx, counter); err != nil {
@@ -304,9 +314,7 @@ func TestDeletedCounterStopsBeingPolled(t *testing.T) {
 
 // Retuning a counter's cadence must take effect without a restart too.
 func TestChangedIntervalRestartsTheWatch(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, db, ctx := newSupervisedPoller(t)
 
 	counter := testCounter()
 	counter.PollInterval = 10
@@ -345,9 +353,7 @@ func TestChangedIntervalRestartsTheWatch(t *testing.T) {
 
 // Reconciling repeatedly must not spawn a second goroutine per counter.
 func TestReconcileIsIdempotent(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, db, ctx := newSupervisedPoller(t)
 
 	if err := db.CreateCounter(ctx, testCounter()); err != nil {
 		t.Fatalf("CreateCounter: %v", err)
@@ -368,8 +374,8 @@ func TestReconcileIsIdempotent(t *testing.T) {
 
 // Shutting down must stop every per-counter goroutine.
 func TestShutdownStopsEveryWatch(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	p, db, parent := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(parent)
 
 	for i, id := range []string{"111", "222"} {
 		c := testCounter()
@@ -390,9 +396,7 @@ func TestShutdownStopsEveryWatch(t *testing.T) {
 }
 
 func TestStartRefusesToRunTwice(t *testing.T) {
-	p, _ := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, _, ctx := newSupervisedPoller(t)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -405,9 +409,7 @@ func TestStartRefusesToRunTwice(t *testing.T) {
 // The "no counters" notice belongs at the moment the set empties, not on every
 // reconcile — an idle install reconciles twice a minute forever.
 func TestEmptyNoticeIsNotRepeated(t *testing.T) {
-	p, db := newSupervisedPoller(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	p, db, ctx := newSupervisedPoller(t)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
