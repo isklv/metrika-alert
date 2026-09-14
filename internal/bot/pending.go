@@ -121,7 +121,7 @@ func (b *Bot) saveCounter(ctx context.Context, p *pendingAction, text string) bo
 	}
 
 	b.reply(ctx, p.chatID, fmt.Sprintf(
-		"✅ Счётчик *%s* добавлен (`%s`, проверка каждые %d мин)\n\n⚠️ Проверки начнутся после перезапуска сервиса.\n\nДалее: /addtrigger %d — создать правило алерта",
+		"✅ Счётчик *%s* добавлен (`%s`, проверка каждые %d мин)\nПроверки начнутся в течение минуты, перезапуск не нужен.\n\nДалее: /addtrigger %d — создать правило алерта",
 		counter.Name, counter.CounterID, interval, counter.ID))
 	return true
 }

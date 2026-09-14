@@ -222,3 +222,226 @@ func TestRunOnceNeedsCounters(t *testing.T) {
 		t.Error("expected an error with no counters configured")
 	}
 }
+
+// ---- Picking up counters without a restart ----
+
+// waitFor polls a condition so a test never sleeps longer than it must.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func newSupervisedPoller(t *testing.T) (*Poller, *model.DB) {
+	t.Helper()
+	db, err := model.OpenDB(filepath.Join(t.TempDir(), "supervise.db"))
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	fake := &byTimeFake{value: steadyExcept(100, nil)}
+	cfg := &MetrikaConfig{BaseURL: fake.serve(t), SettleMinutes: 20, WindowMinutes: 60, StepMinutes: 10, MaxCatchUpSteps: 6}
+	return NewPoller(db, cfg, NewEvaluator(db, &fakeRouter{}, cfg)), db
+}
+
+// The wart this replaces: a counter added through the bot was ignored until the
+// service was restarted.
+func TestCounterAddedAfterStartIsPickedUp(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if p.Watched() != 0 {
+		t.Fatalf("watching %d counters before any exist", p.Watched())
+	}
+
+	if err := db.CreateCounter(ctx, testCounter()); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	// The supervisor reconciles on a timer; drive it directly so the test does
+	// not wait out the interval.
+	if err := p.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	waitFor(t, "the new counter to be polled", func() bool { return p.Watched() == 1 })
+}
+
+// A deleted counter used to leave its goroutine running and failing forever.
+func TestDeletedCounterStopsBeingPolled(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	counter := testCounter()
+	if err := db.CreateCounter(ctx, counter); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, "the counter to be polled", func() bool { return p.Watched() == 1 })
+
+	if err := db.DeleteCounter(ctx, counter.ID); err != nil {
+		t.Fatalf("DeleteCounter: %v", err)
+	}
+	if err := p.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	waitFor(t, "polling to stop", func() bool { return p.Watched() == 0 })
+}
+
+// Retuning a counter's cadence must take effect without a restart too.
+func TestChangedIntervalRestartsTheWatch(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	counter := testCounter()
+	counter.PollInterval = 10
+	if err := db.CreateCounter(ctx, counter); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, "the counter to be polled", func() bool { return p.Watched() == 1 })
+
+	p.mu.Lock()
+	before := p.watched[counter.ID].interval
+	p.mu.Unlock()
+	if before != 10*time.Minute {
+		t.Fatalf("interval = %s, want 10m", before)
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE counters SET poll_interval_minutes = 3 WHERE id = ?`, counter.ID); err != nil {
+		t.Fatalf("retune: %v", err)
+	}
+	if err := p.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	p.mu.Lock()
+	after := p.watched[counter.ID].interval
+	p.mu.Unlock()
+	if after != 3*time.Minute {
+		t.Errorf("interval = %s, want the retuned 3m", after)
+	}
+	if p.Watched() != 1 {
+		t.Errorf("watching %d counters after a retune, want 1", p.Watched())
+	}
+}
+
+// Reconciling repeatedly must not spawn a second goroutine per counter.
+func TestReconcileIsIdempotent(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := db.CreateCounter(ctx, testCounter()); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	for range 5 {
+		if err := p.reconcile(ctx); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	if p.Watched() != 1 {
+		t.Errorf("watching %d counters after repeated reconciles, want 1", p.Watched())
+	}
+}
+
+// Shutting down must stop every per-counter goroutine.
+func TestShutdownStopsEveryWatch(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	for i, id := range []string{"111", "222"} {
+		c := testCounter()
+		c.ID = 0
+		c.CounterID = id
+		c.Name = "counter" + id
+		if err := db.CreateCounter(ctx, c); err != nil {
+			t.Fatalf("CreateCounter %d: %v", i, err)
+		}
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, "both counters to be polled", func() bool { return p.Watched() == 2 })
+
+	cancel()
+	waitFor(t, "every watch to stop", func() bool { return p.Watched() == 0 })
+}
+
+func TestStartRefusesToRunTwice(t *testing.T) {
+	p, _ := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.Start(ctx); err == nil {
+		t.Error("a second Start should be refused")
+	}
+}
+
+// The "no counters" notice belongs at the moment the set empties, not on every
+// reconcile — an idle install reconciles twice a minute forever.
+func TestEmptyNoticeIsNotRepeated(t *testing.T) {
+	p, db := newSupervisedPoller(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	p.mu.Lock()
+	logged := p.emptyLogged
+	p.mu.Unlock()
+	if !logged {
+		t.Fatal("the empty notice was not recorded as shown")
+	}
+
+	// Reconciling again while still empty must not re-arm the notice.
+	if err := p.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	p.mu.Lock()
+	logged = p.emptyLogged
+	p.mu.Unlock()
+	if !logged {
+		t.Error("the notice would be printed again on the next reconcile")
+	}
+
+	// Once a counter appears, the notice arms again for the next empty state.
+	if err := db.CreateCounter(ctx, testCounter()); err != nil {
+		t.Fatalf("CreateCounter: %v", err)
+	}
+	if err := p.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	p.mu.Lock()
+	logged = p.emptyLogged
+	p.mu.Unlock()
+	if logged {
+		t.Error("the notice stayed suppressed after counters returned")
+	}
+}
