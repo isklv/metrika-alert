@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -11,46 +13,88 @@ import (
 
 // Config holds the service configuration.
 type Config struct {
-	Database   string     `yaml:"database"`
+	Database   string      `yaml:"database"`
 	Telegram   TelegramCfg `yaml:"telegram"`
+	VKTeams    VKTeamsCfg  `yaml:"vkteams"`
 	Metrika    MetrikaCfg  `yaml:"metrika"`
 	API        APICfg      `yaml:"api"`
-	ReportHour int         `yaml:"report_interval_hours"` // hours between periodic reports, default 1
+	ReportHour int         `yaml:"report_interval_hours"` // hours between periodic reports, 0 disables
 }
 
 type TelegramCfg struct {
+	BotToken string  `yaml:"bot_token"`
+	AdminIDs []int64 `yaml:"admin_ids"` // user IDs allowed to configure the bot
+	ProxyURL string  `yaml:"proxy_url"` // socks5:// or http:// proxy for Telegram API
+}
+
+// VKTeamsCfg configures the VK Teams (Mail.ru Myteam) bot.
+type VKTeamsCfg struct {
 	BotToken string   `yaml:"bot_token"`
-	AdminIDs []int64  `yaml:"admin_ids"` // user IDs allowed to configure the bot
-	ProxyURL string   `yaml:"proxy_url"` // socks5:// or http:// proxy for Telegram API
+	BaseURL  string   `yaml:"base_url"`  // bot API endpoint, cloud by default
+	AdminIDs []string `yaml:"admin_ids"` // VK Teams user IDs (email- or numeric-like strings)
+	ProxyURL string   `yaml:"proxy_url"`
 }
 
 type MetrikaCfg struct {
+	// BaseURL serves both the Reporting API (/stat/v1/data) and the Logs API
+	// (/management/v1/...), so one host covers everything.
 	BaseURL string `yaml:"base_url"`
-	LogsURL string `yaml:"logs_url"`
+	// LagHours is how far behind now a Logs API export window ends. The API
+	// refuses a window ending today, and recent data keeps settling, so this
+	// cannot usefully drop below about a day.
+	LagHours int `yaml:"lag_hours"`
+	// MaxWindowHours caps one export, bounding catch-up after an outage.
+	MaxWindowHours int `yaml:"max_window_hours"`
 }
 
 type APICfg struct {
 	ListenAddr string `yaml:"listen_addr"`
 	Enabled    bool   `yaml:"enabled"`
+	AuthToken  string `yaml:"auth_token"` // when set, requests must carry it as a bearer token
 }
 
-// DefaultMetrikaURLs returns Yandex.Metrika API endpoints.
-func DefaultMetrikaURLs() (base, logs string) {
-	return "https://api-metrika.yandex.ru", "https://logs.metrika.yandex.ru"
+// DefaultMetrikaURL is the documented Yandex.Metrika API host. Note the .net
+// domain — api-metrika.yandex.ru does not serve the API.
+const DefaultMetrikaURL = "https://api-metrika.yandex.net"
+
+// legacyMetrikaHosts are values earlier releases shipped as defaults. Neither
+// answers the documented API paths, so a config still carrying one is corrected
+// rather than left to fail every call with a 404.
+var legacyMetrikaHosts = map[string]bool{
+	"https://api-metrika.yandex.ru":  true,
+	"https://logs.metrika.yandex.ru": true,
 }
+
+// Logs API export pacing defaults. The API rejects a window ending on the
+// current day, so the lag is a property of the API, not a tuning preference.
+const (
+	DefaultLagHours       = 26
+	DefaultMaxWindowHours = 24
+)
+
+// DefaultVKTeamsURL is the VK Teams cloud bot API. On-premise installations
+// override it via vkteams.base_url or METRIKA_VKTEAMS_BASE.
+const DefaultVKTeamsURL = "https://myteam.mail.ru/bot/v1"
 
 // Load reads config from path, then applies environment variable overrides.
-// Supported env vars (name, colon-separated list of admin IDs, proxy URL, etc.):
-//   METRIKA_DB_PATH        — database file path
-//   METRIKA_DB_DIR         — directory for relative db paths
-//   METRIKA_BOT_TOKEN      — telegram bot token
-//   METRIKA_ADMIN_IDS      — comma-separated admin user IDs
-//   METRIKA_METRIKA_BASE   — metrika API base URL (default: api-metrika.yandex.ru)
-//   METRIKA_METRIKA_LOGS   — logs API base URL (default: logs.metrika.yandex.ru)
-//   METRIKA_API_LISTEN     — REST API listen address (default :8090)
-//   METRIKA_API_ENABLED    — "true" to enable the REST API
-//   METRIKA_REPORT_HOURS   — periodic report interval in hours (default 1)
-//   METRIKA_PROXY_URL      — proxy URL for telegram (socks5:// or http://)
+// Supported env vars:
+//
+//	METRIKA_DB_PATH         — database file path
+//	METRIKA_DB_DIR          — directory for relative db paths
+//	METRIKA_BOT_TOKEN       — telegram bot token
+//	METRIKA_ADMIN_IDS       — comma-separated telegram admin user IDs
+//	METRIKA_PROXY_URL       — proxy URL for telegram (socks5:// or http://)
+//	METRIKA_VKTEAMS_TOKEN   — VK Teams bot token
+//	METRIKA_VKTEAMS_BASE    — VK Teams bot API base URL
+//	METRIKA_VKTEAMS_ADMINS  — comma-separated VK Teams admin user IDs
+//	METRIKA_VKTEAMS_PROXY   — proxy URL for VK Teams
+//	METRIKA_METRIKA_BASE    — metrika API base URL
+//	METRIKA_LAG_HOURS       — how far behind now a Logs API export window ends
+//	METRIKA_MAX_WINDOW_HOURS — largest single export window
+//	METRIKA_API_LISTEN      — REST API listen address
+//	METRIKA_API_ENABLED     — "true" to enable the REST API
+//	METRIKA_API_TOKEN       — bearer token required by the REST API
+//	METRIKA_REPORT_HOURS    — periodic report interval in hours, 0 disables
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -62,12 +106,30 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	baseURL, logsURL := DefaultMetrikaURLs()
-	if c.Metrika.BaseURL == "" {
-		c.Metrika.BaseURL = baseURL
+	applyEnvOverrides(&c)
+	applyDefaults(&c)
+
+	return &c, nil
+}
+
+// applyDefaults fills unset values. Runs after the environment so that an
+// env var and a config key are treated identically.
+func applyDefaults(c *Config) {
+	if c.Metrika.BaseURL == "" || legacyMetrikaHosts[strings.TrimSuffix(c.Metrika.BaseURL, "/")] {
+		if c.Metrika.BaseURL != "" {
+			log.Printf("config: metrika.base_url %q does not serve the Metrika API, using %s",
+				c.Metrika.BaseURL, DefaultMetrikaURL)
+		}
+		c.Metrika.BaseURL = DefaultMetrikaURL
 	}
-	if c.Metrika.LogsURL == "" {
-		c.Metrika.LogsURL = logsURL
+	if c.Metrika.LagHours <= 0 {
+		c.Metrika.LagHours = DefaultLagHours
+	}
+	if c.Metrika.MaxWindowHours <= 0 {
+		c.Metrika.MaxWindowHours = DefaultMaxWindowHours
+	}
+	if c.VKTeams.BaseURL == "" {
+		c.VKTeams.BaseURL = DefaultVKTeamsURL
 	}
 	if c.Database == "" {
 		c.Database = "metrika.db"
@@ -75,13 +137,9 @@ func Load(path string) (*Config, error) {
 	if c.API.ListenAddr == "" {
 		c.API.ListenAddr = ":8090"
 	}
-	if c.ReportHour <= 0 {
-		c.ReportHour = 1
+	if c.ReportHour < 0 {
+		c.ReportHour = 0
 	}
-
-	applyEnvOverrides(&c)
-
-	return &c, nil
 }
 
 // applyEnvOverrides applies METRIKA_* environment variable overrides.
@@ -89,23 +147,47 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("METRIKA_DB_PATH"); v != "" {
 		c.Database = v
 	}
-	if v := os.Getenv("METRIKA_DB_DIR"); v != "" {
+	// METRIKA_DB_DIR only relocates a relative path; an absolute METRIKA_DB_PATH wins.
+	if v := os.Getenv("METRIKA_DB_DIR"); v != "" && !filepath.IsAbs(c.Database) {
 		c.Database = filepath.Join(v, c.Database)
 	}
 	if v := os.Getenv("METRIKA_BOT_TOKEN"); v != "" {
 		c.Telegram.BotToken = v
 	}
 	if v := os.Getenv("METRIKA_ADMIN_IDS"); v != "" {
-		ids, err := parseAdminIDs(v)
-		if err == nil && len(ids) > 0 {
+		if ids, err := parseAdminIDs(v); err == nil && len(ids) > 0 {
 			c.Telegram.AdminIDs = ids
 		}
+	}
+	if v := os.Getenv("METRIKA_PROXY_URL"); v != "" {
+		c.Telegram.ProxyURL = v
+	}
+	if v := os.Getenv("METRIKA_VKTEAMS_TOKEN"); v != "" {
+		c.VKTeams.BotToken = v
+	}
+	if v := os.Getenv("METRIKA_VKTEAMS_BASE"); v != "" {
+		c.VKTeams.BaseURL = v
+	}
+	if v := os.Getenv("METRIKA_VKTEAMS_ADMINS"); v != "" {
+		if ids := splitNonEmpty(v, ","); len(ids) > 0 {
+			c.VKTeams.AdminIDs = ids
+		}
+	}
+	if v := os.Getenv("METRIKA_VKTEAMS_PROXY"); v != "" {
+		c.VKTeams.ProxyURL = v
 	}
 	if v := os.Getenv("METRIKA_METRIKA_BASE"); v != "" {
 		c.Metrika.BaseURL = v
 	}
-	if v := os.Getenv("METRIKA_METRIKA_LOGS"); v != "" {
-		c.Metrika.LogsURL = v
+	if v := os.Getenv("METRIKA_LAG_HOURS"); v != "" {
+		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h > 0 {
+			c.Metrika.LagHours = h
+		}
+	}
+	if v := os.Getenv("METRIKA_MAX_WINDOW_HOURS"); v != "" {
+		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h > 0 {
+			c.Metrika.MaxWindowHours = h
+		}
 	}
 	if v := os.Getenv("METRIKA_API_LISTEN"); v != "" {
 		c.API.ListenAddr = v
@@ -113,84 +195,36 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("METRIKA_API_ENABLED"); v != "" {
 		c.API.Enabled = v == "true" || v == "1" || v == "yes"
 	}
+	if v := os.Getenv("METRIKA_API_TOKEN"); v != "" {
+		c.API.AuthToken = v
+	}
 	if v := os.Getenv("METRIKA_REPORT_HOURS"); v != "" {
-		if h, err := parsePositiveInt(v); err == nil && h > 0 {
+		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h >= 0 {
 			c.ReportHour = h
 		}
-	}
-	if v := os.Getenv("METRIKA_PROXY_URL"); v != "" {
-		c.Telegram.ProxyURL = v
 	}
 }
 
 func parseAdminIDs(s string) ([]int64, error) {
 	var ids []int64
 	for _, part := range splitNonEmpty(s, ",") {
-		part = trimSpace(part)
-		if part == "" {
-			continue
-		}
-		id, err := parseSignedInt(part)
+		id, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("admin_ids: %w", err)
+			return nil, fmt.Errorf("admin_ids: %q is not a user ID: %w", part, err)
 		}
 		ids = append(ids, id)
 	}
 	return ids, nil
 }
 
-func parsePositiveInt(s string) (int, error) {
-	s = trimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("empty value")
-	}
-	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-func parseSignedInt(s string) (int64, error) {
-	s = trimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("empty value")
-	}
-	var n int64
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
 func splitNonEmpty(s, sep string) []string {
 	var out []string
-	for _, part := range split(s, sep) {
-		if p := trimSpace(part); p != "" {
+	for _, part := range strings.Split(s, sep) {
+		if p := strings.TrimSpace(part); p != "" {
 			out = append(out, p)
 		}
 	}
 	return out
-}
-
-func split(s, sep string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i:i+len(sep)] == sep {
-			out = append(out, s[start:i])
-			start = i + len(sep)
-		}
-	}
-	out = append(out, s[start:])
-	return out
-}
-
-func trimSpace(s string) string {
-	return strings.TrimSpace(s)
 }
 
 // ResolvePath expands ~ and relative paths in a config value.
@@ -199,8 +233,7 @@ func ResolvePath(path string) string {
 		return path
 	}
 	if len(path) > 1 && path[0] == '~' {
-		home, err := os.UserHomeDir()
-		if err == nil {
+		if home, err := os.UserHomeDir(); err == nil {
 			path = filepath.Join(home, path[1:])
 		}
 	}

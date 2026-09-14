@@ -10,3 +10,9 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Local runtime config and database
+config.yaml
+*.db
+*.db-wal
+*.db-shm

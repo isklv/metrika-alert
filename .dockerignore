@@ -1,0 +1,12 @@
+.git
+.gitignore
+.woodpecker.yml
+dist/
+build/
+metrika-alert
+*.db
+*.db-wal
+*.db-shm
+config.yaml
+README.md
+DEPLOY.md

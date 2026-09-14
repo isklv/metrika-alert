@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -16,34 +19,87 @@ import (
 
 // Server exposes REST endpoints for managing counters, monitors, triggers, alerts.
 type Server struct {
-	db       *model.DB
-	reporter *engine.Reporter
-	poller   *engine.Poller
-	mux      *http.ServeMux
-	listen   string
+	db        *model.DB
+	reporter  *engine.Reporter
+	poller    *engine.Poller
+	metrika   *engine.MetrikaConfig
+	mux       *http.ServeMux
+	listen    string
+	authToken string
 }
 
-func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, listenAddr string) *Server {
-	s := &Server{db: db, reporter: reporter, poller: poller, listen: listenAddr, mux: http.NewServeMux()}
+// Config wires the API server. AuthToken, when set, is required as a bearer
+// token on every request.
+type Config struct {
+	ListenAddr string
+	AuthToken  string
+	Metrika    *engine.MetrikaConfig
+}
+
+func NewServer(db *model.DB, reporter *engine.Reporter, poller *engine.Poller, cfg Config) *Server {
+	s := &Server{
+		db:        db,
+		reporter:  reporter,
+		poller:    poller,
+		metrika:   cfg.Metrika,
+		listen:    cfg.ListenAddr,
+		authToken: cfg.AuthToken,
+		mux:       http.NewServeMux(),
+	}
 	s.routes()
 	return s
 }
 
+// authorized reports whether a request may proceed. With no token configured
+// the API is open, which is only safe on a loopback or private listen address —
+// the deployment guide says so, and startup logs a warning.
+func (s *Server) authorized(r *http.Request) bool {
+	if s.authToken == "" {
+		return true
+	}
+	header := r.Header.Get("Authorization")
+	token, ok := strings.CutPrefix(header, "Bearer ")
+	if !ok {
+		return false
+	}
+	// Constant-time compare keeps the token from leaking through timing.
+	return subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) == 1
+}
+
+// withAuth wraps a handler with the bearer-token check.
+func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
 func (s *Server) routes() {
-	s.mux.HandleFunc("/api/counters", s.handleCounters)
-	s.mux.HandleFunc("/api/monitors", s.handleMonitors)
-	s.mux.HandleFunc("/api/triggers", s.handleTriggers)
-	s.mux.HandleFunc("/api/alert-actions", s.handleAlertActions)
-	s.mux.HandleFunc("/api/alerts", s.handleAlerts)
-	s.mux.HandleFunc("/api/reports", s.handleReports)
-	s.mux.HandleFunc("/api/events", s.handleEvents)
-	s.mux.HandleFunc("/api/status", s.handleStatus)
+	s.mux.HandleFunc("/api/counters", s.withAuth(s.handleCounters))
+	s.mux.HandleFunc("/api/monitors", s.withAuth(s.handleMonitors))
+	s.mux.HandleFunc("/api/triggers", s.withAuth(s.handleTriggers))
+	s.mux.HandleFunc("/api/alert-actions", s.withAuth(s.handleAlertActions))
+	s.mux.HandleFunc("/api/alerts", s.withAuth(s.handleAlerts))
+	s.mux.HandleFunc("/api/reports", s.withAuth(s.handleReports))
+	s.mux.HandleFunc("/api/status", s.withAuth(s.handleStatus))
+	// Liveness probe: unauthenticated on purpose, and reveals nothing.
+	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	server := &http.Server{
-		Addr:    s.listen,
-		Handler: s.mux,
+		Addr:              s.listen,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -53,6 +109,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		server.Shutdown(shutdownCtx)
 	}()
 
+	if s.authToken == "" {
+		log.Printf("api server: WARNING — no auth_token set; anyone who can reach %s can read and write counters", s.listen)
+	}
 	log.Printf("api server listening on %s", s.listen)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("api server: %w", err)
@@ -119,22 +178,27 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 		data, err := s.db.ListMonitors(r.Context(), counterID)
 		s.getJSON(w, data, err)
 	case http.MethodPost:
-		if counterID <= 0 {
-			counterID = parseBodyInt64(r, "counter_id")
+		body, err := readBody(r)
+		if err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
 		}
-		s.createMonitor(w, r, counterID)
+		if counterID <= 0 {
+			counterID = bodyInt64(body, "counter_id")
+		}
+		s.createMonitor(w, r, body, counterID)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request, counterID int64) {
+func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request, raw []byte, counterID int64) {
 	var body struct {
 		Name       string   `json:"name"`
 		URLPattern string   `json:"url_pattern"`
 		Metrics    []string `json:"metrics"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -173,25 +237,30 @@ func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request) {
 		data, err := s.db.ListTriggers(r.Context(), counterID)
 		s.getJSON(w, data, err)
 	case http.MethodPost:
-		if counterID <= 0 {
-			counterID = parseBodyInt64(r, "counter_id")
+		body, err := readBody(r)
+		if err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
 		}
-		s.createTrigger(w, r, counterID)
+		if counterID <= 0 {
+			counterID = bodyInt64(body, "counter_id")
+		}
+		s.createTrigger(w, r, body, counterID)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, counterID int64) {
+func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byte, counterID int64) {
 	var body struct {
-		Name           string `json:"name"`
-		MonitorID      *int64 `json:"monitor_id,omitempty"`
-		Condition      string `json:"condition"`
-		Threshold      int    `json:"threshold"`
-		WindowMinutes  int    `json:"window_minutes"`
-		CooldownMinutes int   `json:"cooldown_minutes"`
+		Name            string `json:"name"`
+		MonitorID       *int64 `json:"monitor_id,omitempty"`
+		Condition       string `json:"condition"`
+		Threshold       int    `json:"threshold"`
+		WindowMinutes   int    `json:"window_minutes"`
+		CooldownMinutes int    `json:"cooldown_minutes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -263,8 +332,8 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, "report queued")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"status": "report delivered"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -272,47 +341,9 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) runReportForCounter(ctx context.Context, counterID int64) error {
 	if counterID > 0 {
-		counter, err := s.db.GetCounter(ctx, counterID)
-		if err != nil {
-			return err
-		}
-		client := engine.NewMetrikaClient(counter, "", "")
-		return s.reporter.ReportCounter(ctx, counter, client, time.Now())
+		return s.reporter.RunReportFor(ctx, counterID)
 	}
 	return s.reporter.RunReports(ctx)
-}
-
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
-	if counterID <= 0 {
-		http.Error(w, "counter_id required", http.StatusBadRequest)
-		return
-	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 {
-		limit = 100
-	}
-
-	type eventOut struct {
-		EventTime string `json:"event_time"`
-		PageURL   string `json:"page_url"`
-		Title     string `json:"title"`
-		GoalsID   []string `json:"goals_id"`
-		Status    string `json:"status_code"`
-		Revenue   float64 `json:"revenue"`
-	}
-
-	alerts, err := s.db.RecentAlerts(r.Context(), counterID, 0)
-	if err == nil {
-		// Events are not persisted individually — return empty with note.
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"note":   "raw events are streamed, not persisted. Use /api/reports for aggregated data.",
-			"alerts": len(alerts),
-		})
-		return
-	}
-	s.getJSON(w, nil, err)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -334,14 +365,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // ---- helpers ----
 
 func (s *Server) getJSON(w http.ResponseWriter, data any, err error) {
-	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if data == nil {
+	// An empty result is a nil slice, which marshals to `null`. A list endpoint
+	// should answer with an empty array so clients can iterate unconditionally.
+	if v := reflect.ValueOf(data); !v.IsValid() || (v.Kind() == reflect.Slice && v.IsNil()) {
 		data = []any{}
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
 }
 
@@ -353,14 +386,25 @@ func parseOptionalInt64(s string) int64 {
 	return v
 }
 
-func parseBodyInt64(r *http.Request, key string) int64 {
+// maxBodyBytes caps a request body; the payloads here are a few hundred bytes.
+const maxBodyBytes = 1 << 20
+
+// readBody buffers the request body so it can be decoded more than once. The
+// previous helpers each decoded straight from r.Body, so the second one always
+// saw an already-drained reader and failed with EOF.
+func readBody(r *http.Request) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+}
+
+// bodyInt64 pulls one integer field out of a buffered JSON body.
+func bodyInt64(raw []byte, key string) int64 {
 	var body map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return 0
 	}
 	var v int64
-	if raw, ok := body[key]; ok {
-		json.Unmarshal(raw, &v)
+	if field, ok := body[key]; ok {
+		json.Unmarshal(field, &v)
 	}
 	return v
 }

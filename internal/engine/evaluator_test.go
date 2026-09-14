@@ -47,10 +47,10 @@ func newTestEvaluator(t *testing.T) (*Evaluator, *model.DB, *alertRouter) {
 
 func TestMatchCondition(t *testing.T) {
 	tests := []struct {
-		name  string
-		ev    *model.MetrikaEvent
-		cond  string
-		want  bool
+		name string
+		ev   *model.MetrikaEvent
+		cond string
+		want bool
 	}{
 		{"status equals", &model.MetrikaEvent{Status: "500"}, "status_code == 500", true},
 		{"status not equal", &model.MetrikaEvent{Status: "200"}, "status_code == 500", false},
@@ -176,8 +176,8 @@ func TestEvaluatorAlertsOnThreshold(t *testing.T) {
 		Threshold: 3,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -230,8 +230,8 @@ func TestEvaluatorDedupWithinCooldown(t *testing.T) {
 		Threshold: 2,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -279,8 +279,8 @@ func TestEvaluatorNoAlertBelowThreshold(t *testing.T) {
 		Threshold: 5,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -366,41 +366,41 @@ func TestEvaluatorMonitorScopedTrigger(t *testing.T) {
 
 	monitorID := monitor.ID
 	trig := &model.Trigger{
-		CounterID:  c.ID,
-		MonitorID:  &monitorID,
-		Name:       "Checkout 500s",
-		Condition:  "status_code == 500",
-		Threshold:  2,
-		Window:     60,
-		Cooldown:   30,
-	
-		Enabled:   true,
+		CounterID: c.ID,
+		MonitorID: &monitorID,
+		Name:      "Checkout 500s",
+		Condition: "status_code == 500",
+		Threshold: 2,
+		Window:    60,
+		Cooldown:  30,
+
+		Enabled: true,
 	}
-		if err := db.CreateTrigger(context.Background(), trig); err != nil {
-			t.Fatalf("create trigger: %v", err)
-		}
+	if err := db.CreateTrigger(context.Background(), trig); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
 
-		// Debug diagnostics.
-		trigs, _ := db.ListTriggers(context.Background(), c.ID)
-		mons, _ := db.ListMonitors(context.Background(), c.ID)
-		fmt.Printf("diagnose: triggers=%d monitors=%d\n", len(trigs), len(mons))
-		for _, tr := range trigs {
-			mid := "<nil>"
-			if tr.MonitorID != nil {
-				mid = fmt.Sprintf("%d", *tr.MonitorID)
-			}
-			fmt.Printf("  trigger id=%d monitor_id=%s enabled=%v\n", tr.ID, mid, tr.Enabled)
+	// Debug diagnostics.
+	trigs, _ := db.ListTriggers(context.Background(), c.ID)
+	mons, _ := db.ListMonitors(context.Background(), c.ID)
+	fmt.Printf("diagnose: triggers=%d monitors=%d\n", len(trigs), len(mons))
+	for _, tr := range trigs {
+		mid := "<nil>"
+		if tr.MonitorID != nil {
+			mid = fmt.Sprintf("%d", *tr.MonitorID)
 		}
-		for _, m := range mons {
-			fmt.Printf("  monitor id=%d pattern=%q enabled=%v\n", m.ID, m.URLPattern, m.Enabled)
-		}
+		fmt.Printf("  trigger id=%d monitor_id=%s enabled=%v\n", tr.ID, mid, tr.Enabled)
+	}
+	for _, m := range mons {
+		fmt.Printf("  monitor id=%d pattern=%q enabled=%v\n", m.ID, m.URLPattern, m.Enabled)
+	}
 
-		now := time.Now()
-		events := []*model.MetrikaEvent{
-			{EventTime: now, PageURL: "/checkout/step1", Status: "500"},
-			{EventTime: now.Add(-2 * time.Minute), PageURL: "/checkout/step2", Status: "500"},
-			{EventTime: now.Add(-3 * time.Minute), PageURL: "/home", Status: "500"}, // outside monitor
-		}
+	now := time.Now()
+	events := []*model.MetrikaEvent{
+		{EventTime: now, PageURL: "/checkout/step1", Status: "500"},
+		{EventTime: now.Add(-2 * time.Minute), PageURL: "/checkout/step2", Status: "500"},
+		{EventTime: now.Add(-3 * time.Minute), PageURL: "/home", Status: "500"}, // outside monitor
+	}
 
 	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
 		t.Fatalf("evaluate: %v", err)
@@ -436,8 +436,8 @@ func TestEvaluatorMultipleTriggersOneCounter(t *testing.T) {
 		Threshold: 2,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	trig2 := &model.Trigger{
 		CounterID: c.ID,
@@ -446,8 +446,8 @@ func TestEvaluatorMultipleTriggersOneCounter(t *testing.T) {
 		Threshold: 50,
 		Window:    1440,
 		Cooldown:  60,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig1); err != nil {
 		t.Fatalf("create trigger1: %v", err)
@@ -506,8 +506,8 @@ func TestEvaluatorOldEventsOutsideWindowIgnored(t *testing.T) {
 		Threshold: 1,
 		Window:    5, // only last 5 minutes
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -547,8 +547,8 @@ func TestEvaluatorRevenueCondition(t *testing.T) {
 		Threshold: 2,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -591,14 +591,14 @@ func TestEvaluatorAlertRecordedInDB(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
 	}
 
-		events := []*model.MetrikaEvent{{EventTime: time.Now(), Status: "500"}}
+	events := []*model.MetrikaEvent{{EventTime: time.Now(), Status: "500"}}
 	if err := eval.Evaluate(context.Background(), c.ID, events); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
@@ -664,8 +664,8 @@ func TestEvaluatorLogsErrorOnAlertDeliveryFailure(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -699,8 +699,8 @@ func TestEvaluatorWithEmptyEvents(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -749,8 +749,8 @@ func TestEvaluatorWithInvalidCondition(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -787,8 +787,8 @@ func TestEvaluatorWithRevenueThreshold(t *testing.T) {
 		Threshold: 2,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -829,8 +829,8 @@ func TestEvaluatorWithRevenueThresholdFromFloat64(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -867,8 +867,8 @@ func TestEvaluatorWithRevenueThresholdFromInt(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
@@ -906,8 +906,8 @@ func TestEvaluatorWithRevenueThresholdFromJSONNumber(t *testing.T) {
 		Threshold: 1,
 		Window:    60,
 		Cooldown:  30,
-	
-		Enabled:   true,
+
+		Enabled: true,
 	}
 	if err := db.CreateTrigger(context.Background(), trig); err != nil {
 		t.Fatalf("create trigger: %v", err)
