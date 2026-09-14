@@ -1,37 +1,46 @@
 # Woodpecker CI pipeline for metrika-alert
 # Docs: https://woodpecker-ci.org/docs/
+#
+# Steps must sit under the top-level `steps:` key — a bare list is not a valid
+# pipeline and Woodpecker rejects the file.
+steps:
+  # Test suite — runs on every push and pull request.
+  - name: test
+    image: golang:1.25-bookworm
+    commands:
+      # The module is vendored: verify the tree matches go.mod instead of
+      # letting `go mod tidy` rewrite it inside CI.
+      # gofmt exits 0 even on unformatted input, so the output itself is the gate.
+      - test -z "$(gofmt -l ./cmd ./internal)" || { gofmt -l ./cmd ./internal; exit 1; }
+      - go mod verify
+      - go build -mod=vendor -v ./...
+      - go vet -mod=vendor ./...
+      - go test -mod=vendor -race -timeout 5m ./...
 
-# Test suite — runs on every push and PR.
-- name: test
-  image: golang:1.24-bookworm
-  commands:
-    - go mod tidy -v
-    - go build -v ./...
-    - go vet ./...
-    - go test -race -timeout 5m ./...
+  # Build the static binary for the target platform.
+  - name: build
+    image: golang:1.25-bookworm
+    depends_on: [test]
+    commands:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-s -w" -o dist/metrika-alert ./cmd/server
+    when:
+      event: push
+      branch: master
 
-# Build static binary — produces metrika-alert for the target platform.
-- name: build
-  image: golang:1.24-bookworm
-  depends_on: [test]
-  commands:
-    - CGO_ENABLED=0 GOOS=${GOOS:-linux} GOARCH=${GOARCH:-amd64} go build -ldflags="-s -w" -o dist/metrika-alert ./cmd/server
-  when:
-    event: push
-    branch: main
-  platforms:
-    - linux/amd64
-
-# Build and push Docker image to ghcr.io.
-- name: docker
-  image: plugins/docker
-  settings:
-    registry: ghcr.io
-    repo: ghcr.io/isklv/metrika-alert
-    tags: ["${CI_COMMIT_SHA}", "latest"]
-    username: ${GHCR_USERNAME}
-    password: ${GHCR_TOKEN}
-  depends_on: [test]
-  when:
-    event: push
-    branch: main
+  # Build and push the image to ghcr.io.
+  - name: docker
+    image: plugins/docker
+    depends_on: [test]
+    settings:
+      registry: ghcr.io
+      repo: ghcr.io/isklv/metrika-alert
+      tags:
+        - ${CI_COMMIT_SHA}
+        - latest
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+    when:
+      event: push
+      branch: master

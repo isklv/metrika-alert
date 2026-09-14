@@ -1,0 +1,46 @@
+[Unit]
+Description=Metrika Alert — Yandex.Metrika monitor with Telegram and VK Teams alerts
+Documentation=https://github.com/isklv/metrika-alert
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=metrika
+Group=metrika
+ExecStart=/usr/local/bin/metrika-alert /etc/metrika-alert/config.yaml
+Restart=on-failure
+RestartSec=10s
+
+# Secrets can live here instead of in config.yaml, so the config stays
+# world-readable while the tokens do not. chmod 600, owned by root.
+EnvironmentFile=-/etc/metrika-alert/env
+
+# The database lives here; StateDirectory creates it with the right owner.
+StateDirectory=metrika-alert
+Environment=METRIKA_DB_DIR=/var/lib/metrika-alert
+Environment=HOME=/var/lib/metrika-alert
+
+# The service needs outbound HTTPS and its own state directory, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Graceful shutdown: the bots stop their long polls, then the process exits.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

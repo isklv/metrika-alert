@@ -1,24 +1,59 @@
-# Database: relative path resolved under ~/.metrika-alert/, or absolute path.
+# Database: relative path resolved under ~/.metrika-alert/, or an absolute path.
 database: metrika.db
 
-# Telegram bot (from @BotFather). Required for alert delivery.
+# --- Telegram -----------------------------------------------------------------
 telegram:
+  # Token from @BotFather. Leave empty to disable the Telegram channel.
   bot_token: ""
-  # User IDs allowed to use the bot (comma-separated list in yaml).
+  # Users allowed to configure the service. An EMPTY LIST LOCKS THE BOT DOWN:
+  # it refuses every command. Message the bot and it replies with the ID to add.
   admin_ids:
     - 123456789
-  # Optional SOCKS5/HTTP proxy for Telegram API calls.
+  # Optional SOCKS5/HTTP proxy for the Telegram API.
   # proxy_url: socks5://user:pass@proxy.example.com:1080
 
-# Yandex.Metrika API endpoints (usually no need to change).
-metrika:
-  base_url: https://api-metrika.yandex.ru
-  logs_url: https://logs.metrika.yandex.ru
+# --- VK Teams (ВК Тимс) -------------------------------------------------------
+vkteams:
+  # Token issued by @Metabot in VK Teams. Leave empty to disable this channel.
+  bot_token: ""
+  # Cloud endpoint by default. On-premise installations point this at their own
+  # host, e.g. https://myteam.corp.example/bot/v1
+  base_url: https://myteam.mail.ru/bot/v1
+  # VK Teams user IDs (address-like or numeric strings), same lockdown rule as
+  # Telegram above. Send /whoami to the bot to learn your ID.
+  admin_ids:
+    - user@corp.example
+  # proxy_url: http://proxy.corp.example:3128
 
-# REST API (optional, for external integrations).
+# --- Yandex.Metrika -----------------------------------------------------------
+# OAuth tokens are stored per counter in the database, not here.
+metrika:
+  # One host serves both APIs this service uses: the Reporting API
+  # (/stat/v1/data) for reports and the Logs API (/management/v1/...) for raw
+  # events. Note the .net domain — api-metrika.yandex.ru does not serve the API.
+  base_url: https://api-metrika.yandex.net
+
+  # How far behind now a Logs API export window ends.
+  #
+  # This is a property of the API, not a tuning preference: Metrika refuses a
+  # window ending on the current day, and recent data keeps settling for hours
+  # after that. Lowering this below ~26 makes exports fail or return partial
+  # data. It is also why event triggers alert on yesterday, not on right now —
+  # see DEPLOY.md §6.
+  lag_hours: 26
+
+  # Largest single export. A counter that fell behind is caught up one window
+  # per poll rather than in one request Metrika would refuse on quota.
+  max_window_hours: 24
+
+# --- REST API (optional) ------------------------------------------------------
 api:
   enabled: false
   listen_addr: ":8090"
+  # Required as "Authorization: Bearer <token>" on every /api/ request. Leave
+  # empty ONLY when the listen address is loopback or a trusted private network:
+  # the API creates counters and reads alert history.
+  auth_token: ""
 
-# Periodic report interval in hours. Set to 0 to disable.
+# Periodic report interval in hours. 0 disables periodic reports.
 report_interval_hours: 1

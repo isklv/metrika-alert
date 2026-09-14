@@ -88,20 +88,30 @@ func (e *Evaluator) Evaluate(ctx context.Context, counterID int64, events []*mod
 
 // matchEvents counts events matching a trigger's condition within the window.
 func (e *Evaluator) matchEvents(ctx context.Context, t *model.Trigger, events []*model.MetrikaEvent, windowStart time.Time) (int, error) {
+	// Monitor-scoped triggers restrict matching to one page pattern. Resolve it
+	// once: a poll delivers thousands of events, and looking the monitor up per
+	// event meant thousands of identical queries per trigger.
+	var pattern string
+	if t.MonitorID != nil {
+		monitor, err := e.getMonitorForTrigger(ctx, t.CounterID, *t.MonitorID)
+		if err != nil {
+			return 0, err
+		}
+		// A missing or disabled monitor scopes the trigger to nothing.
+		if monitor == nil {
+			return 0, nil
+		}
+		pattern = monitor.URLPattern
+	}
+
 	count := 0
 	for _, ev := range events {
 		if ev.EventTime.Before(windowStart) {
 			continue
 		}
-
-		// Monitor-scoped triggers only fire for events on monitored pages.
-		if t.MonitorID != nil {
-			monitor, err := e.getMonitorForTrigger(ctx, t.CounterID, *t.MonitorID)
-			if err != nil || monitor == nil || !pageMatches(monitor.URLPattern, ev.PageURL) {
-				continue
-			}
+		if t.MonitorID != nil && !pageMatches(pattern, ev.PageURL) {
+			continue
 		}
-
 		if matchCondition(t.Condition, ev) {
 			count++
 		}
