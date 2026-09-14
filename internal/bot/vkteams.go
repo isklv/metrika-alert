@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/isklv/metrika-alert/internal/vkteams"
 )
@@ -20,6 +21,17 @@ func NewVKTeamsTransport(client *vkteams.Client) *VKTeamsTransport {
 }
 
 func (t *VKTeamsTransport) Name() string { return "vkteams" }
+
+// MaxUnits keeps VK Teams replies within what its API accepts.
+func (t *VKTeamsTransport) MaxUnits() int { return vkteams.MaxMessageRunes - 200 }
+
+// Measure counts the message after conversion to HTML, which is what actually
+// goes over the wire. The tags are not free: a list of `goal:N` entries gains
+// thirteen characters per line, and measuring the Markdown instead let a reply
+// pass the check and then be truncated.
+func (t *VKTeamsTransport) Measure(text string) int {
+	return utf8.RuneCountInString(vkteams.FromMarkdown(text))
+}
 
 // Send converts the bot's Markdown into the HTML subset VK Teams renders.
 func (t *VKTeamsTransport) Send(ctx context.Context, chatID, text string) error {

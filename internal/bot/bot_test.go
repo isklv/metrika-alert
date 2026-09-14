@@ -20,6 +20,11 @@ type fakeTransport struct {
 
 func (f *fakeTransport) Name() string { return "vkteams" }
 
+// MaxUnits mirrors Telegram's ceiling, the tighter of the two platforms.
+func (f *fakeTransport) MaxUnits() int { return telegramMaxUnits }
+
+func (f *fakeTransport) Measure(text string) int { return utf16Len(text) }
+
 func (f *fakeTransport) Send(_ context.Context, chatID, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -577,4 +582,47 @@ func TestGoalsErrorBlamesTheTokenOnlyWhenRefused(t *testing.T) {
 			t.Errorf("the real error was not reported:\n%s", got)
 		}
 	})
+}
+
+// The reported failure: Telegram rejected the whole goal list as too long, so
+// the reply was lost entirely instead of arriving in pieces.
+func TestLongReplyArrivesInParts(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+
+	var goals []engine.Goal
+	for i := range 250 {
+		goals = append(goals, engine.Goal{
+			ID:   int64(200000000 + i),
+			Name: fmt.Sprintf("Цель с довольно длинным названием номер %d", i),
+			Type: "action",
+		})
+	}
+	b.metrika = &fakeMetrika{goals: goals}
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+
+	before := len(tr.sent)
+	say(t, b, "/goals 1")
+	parts := tr.sent[before:]
+
+	if len(parts) < 2 {
+		t.Fatalf("a 250-goal list went out as %d message(s); Telegram would reject it", len(parts))
+	}
+	for i, part := range parts {
+		if n := utf16Len(part); n > b.transport.MaxUnits() {
+			t.Errorf("part %d is %d units, over the %d limit", i, n, b.transport.MaxUnits())
+		}
+		// Each part says where it sits in the sequence.
+		if !strings.Contains(part, fmt.Sprintf("(%d/%d)", i+1, len(parts))) {
+			t.Errorf("part %d carries no position marker", i)
+		}
+	}
+
+	// Every goal survives the split.
+	all := strings.Join(parts, "\n")
+	for _, id := range []int{200000000, 200000124, 200000249} {
+		if !strings.Contains(all, fmt.Sprintf("goal:%d", id)) {
+			t.Errorf("goal:%d was lost", id)
+		}
+	}
 }

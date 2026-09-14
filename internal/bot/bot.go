@@ -25,6 +25,14 @@ type Transport interface {
 	Send(ctx context.Context, chatID, text string) error
 	// Name identifies the platform in logs and in the alert-action type column.
 	Name() string
+	// MaxUnits is the longest message the platform accepts, in whatever units
+	// Measure returns. Replies longer than this are split, not truncated.
+	MaxUnits() int
+	// Measure reports how long text will be once this transport has rendered
+	// it. Splitting on the unrendered text is not enough: VK Teams converts
+	// Markdown to HTML first, and the tags alone pushed a goal list back over
+	// the limit, where it was silently truncated.
+	Measure(text string) int
 }
 
 // Message is one inbound chat message, normalised across transports.
@@ -180,9 +188,28 @@ func parseCommand(text string) (command, args string) {
 	return strings.ToLower(command), args
 }
 
+// reply delivers text, splitting it across messages when the platform will not
+// take it in one. A rejected over-long reply used to be lost entirely.
 func (b *Bot) reply(ctx context.Context, chatID, text string) {
-	if err := b.transport.Send(ctx, chatID, text); err != nil {
-		log.Printf("bot %s: send to %s: %v", b.transport.Name(), chatID, err)
+	limit := b.transport.MaxUnits()
+
+	parts := splitMessage(text, limit, b.transport.Measure)
+	if len(parts) > 1 {
+		// The position marker is appended after the split, so the split has to
+		// leave room for it — otherwise the last part overshoots the limit by
+		// exactly the marker's width.
+		parts = splitMessage(text, limit-positionMarkerReserve, b.transport.Measure)
+	}
+
+	for i, part := range parts {
+		if len(parts) > 1 {
+			part = fmt.Sprintf("%s\n\n_(%d/%d)_", part, i+1, len(parts))
+		}
+		if err := b.transport.Send(ctx, chatID, part); err != nil {
+			log.Printf("bot %s: send to %s (part %d/%d): %v",
+				b.transport.Name(), chatID, i+1, len(parts), err)
+			return
+		}
 	}
 }
 

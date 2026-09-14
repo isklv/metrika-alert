@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/isklv/metrika-alert/internal/model"
@@ -249,19 +248,39 @@ const telegramLimit = 4000
 
 const truncationNotice = "\n\n…сообщение обрезано"
 
-// truncateRunes cuts on a rune boundary. Cutting by bytes would split a
-// multi-byte character and produce invalid UTF-8 that Telegram rejects.
+// utf16Len measures a string the way Telegram does: in UTF-16 code units, not
+// runes. Every emoji in an alert costs two, and these alerts open with one.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// truncateRunes cuts on a rune boundary, counting as the platform counts.
+// Cutting by bytes would split a multi-byte character and produce invalid
+// UTF-8 that Telegram rejects outright.
 func truncateRunes(s string, limit int) string {
-	if utf8.RuneCountInString(s) <= limit {
+	if utf16Len(s) <= limit {
 		return s
 	}
-	keep := limit - utf8.RuneCountInString(truncationNotice)
+
+	keep := limit - utf16Len(truncationNotice)
 	count := 0
-	for i := range s {
-		if count == keep {
+	for i, r := range s {
+		width := 1
+		if r > 0xFFFF {
+			width = 2
+		}
+		if count+width > keep {
 			return s[:i] + truncationNotice
 		}
-		count++
+		count += width
 	}
 	return s
 }

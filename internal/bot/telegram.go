@@ -20,6 +20,13 @@ func NewTelegramTransport(api *tgbotapi.BotAPI) *TelegramTransport {
 
 func (t *TelegramTransport) Name() string { return "telegram" }
 
+// MaxUnits is Telegram's per-message ceiling, with room for the part counter.
+func (t *TelegramTransport) MaxUnits() int { return telegramMaxUnits }
+
+// Measure counts UTF-16 code units, as Telegram does. Markdown is sent through
+// unchanged, so the text is measured as written.
+func (t *TelegramTransport) Measure(text string) int { return utf16Len(text) }
+
 // Send delivers Markdown text. Counter names and Metrika page titles routinely
 // contain characters Telegram treats as markup, so a rejected message is retried
 // without formatting instead of being lost.
