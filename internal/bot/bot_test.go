@@ -87,7 +87,7 @@ func TestAddTriggerFlowPersists(t *testing.T) {
 	say(t, b, "Магазин 12345678 y0_token")
 
 	say(t, b, "/addtrigger 1")
-	say(t, b, "Ошибки чекаута | status_code == 500 | 3 15 60")
+	say(t, b, "Визиты упали | visits | drop | 40")
 
 	triggers, err := db.ListTriggers(context.Background(), 1)
 	if err != nil {
@@ -98,16 +98,16 @@ func TestAddTriggerFlowPersists(t *testing.T) {
 	}
 
 	got := triggers[0]
-	// Name and condition both contain spaces; the pipe form is what keeps them
-	// apart. A positional parse would have mangled this.
-	if got.Name != "Ошибки чекаута" {
-		t.Errorf("name = %q, want %q", got.Name, "Ошибки чекаута")
+	// The name contains a space, so the pipe form is what keeps it apart from
+	// the metric. A positional parse would have mangled this.
+	if got.Name != "Визиты упали" {
+		t.Errorf("name = %q", got.Name)
 	}
-	if got.Condition != "status_code == 500" {
-		t.Errorf("condition = %q", got.Condition)
+	if got.Metric != "visits" || got.Direction != "drop" || got.DeviationPct != 40 {
+		t.Errorf("rule = %+v", got)
 	}
-	if got.Threshold != 3 || got.Window != 15 || got.Cooldown != 60 {
-		t.Errorf("threshold/window/cooldown = %d/%d/%d, want 3/15/60", got.Threshold, got.Window, got.Cooldown)
+	if got.BaselineWeeks != 4 || got.MinBaseline != 10 {
+		t.Errorf("defaults not applied: %+v", got)
 	}
 }
 
@@ -119,15 +119,22 @@ func TestAddTriggerRejectsMalformedInputWithoutPanicking(t *testing.T) {
 	say(t, b, "/addtrigger 1")
 
 	for _, bad := range []string{
-		"Ошибки status_code == 500 3",
-		"Ошибки | status_code == 500",
-		"Ошибки | status_code == 500 | 3 15",
-		"Ошибки | status_code == 500 | ноль 15 60",
-		"| status_code == 500 | 3 15 60",
+		"Визиты visits drop 40",
+		"Визиты | visits | drop",
+		"Визиты | нетакой | drop | 40",
+		"Визиты | visits | вбок | 40",
+		"Визиты | visits | drop | сорок",
+		"Визиты | visits | drop | 0",
+		"Визиты | visits | drop | 140",
+		"| visits | drop | 40",
+		"Заказы | goal:abc | drop | 40",
 	} {
 		say(t, b, bad)
-		if !strings.Contains(tr.last(), "формат") && !strings.Contains(tr.last(), "числ") && !strings.Contains(tr.last(), "пуст") {
-			t.Errorf("input %q: expected a validation message, got %q", bad, tr.last())
+		last := tr.last()
+		if !strings.ContainsAny(last, "❌") && !strings.Contains(last, "формат") &&
+			!strings.Contains(last, "Направление") && !strings.Contains(last, "Порог") &&
+			!strings.Contains(last, "пуст") {
+			t.Errorf("input %q: expected a validation message, got %q", bad, last)
 		}
 	}
 
@@ -137,7 +144,7 @@ func TestAddTriggerRejectsMalformedInputWithoutPanicking(t *testing.T) {
 	}
 
 	// The flow stays open, so a correct retry still works.
-	say(t, b, "Ошибки | status_code == 500 | 3 15 60")
+	say(t, b, "Визиты | visits | drop | 40")
 	if triggers, _ = db.ListTriggers(context.Background(), 1); len(triggers) != 1 {
 		t.Fatal("retry after a malformed answer did not create the trigger")
 	}

@@ -10,71 +10,81 @@ import (
 	"github.com/isklv/metrika-alert/internal/model"
 )
 
-// EventConsumer receives batches of events per counter.
-type EventConsumer func(counterID int64, events []*model.MetrikaEvent) error
-
-// Poller drives the Logs API export lifecycle for every counter.
+// Poller walks each counter forward through measurement windows.
 //
-// The Logs API is asynchronous, so a poll tick does not fetch events — it
-// advances a state machine:
-//
-//	no export        → order one for the window after the watermark
-//	export pending   → ask Metrika whether it is ready
-//	export processed → download, evaluate, advance watermark, clean up
-//	export failed    → drop it so the next tick orders a fresh one
-//
-// That is also why the export is recorded in the database: it routinely
-// outlives the tick that ordered it, and an untracked one would sit against
-// the counter's quota forever.
+// The window is an hour wide but advances in ten-minute steps, so a drop is
+// noticed within minutes instead of at the end of the hour, while the figure
+// compared stays at hourly scale. Only settled data is judged: a window whose
+// tail is still filling would read low against complete ones every time.
 type Poller struct {
-	db       *model.DB
-	cfg      *MetrikaConfig
-	consumer EventConsumer
+	db        *model.DB
+	cfg       *MetrikaConfig
+	evaluator *Evaluator
 
 	mu      sync.Mutex
 	running bool
 }
 
-// MetrikaConfig points the engine at the API and bounds how far back it looks.
+// MetrikaConfig points the engine at the API and bounds how it reads history.
 type MetrikaConfig struct {
 	// BaseURL is the API host, https://api-metrika.yandex.net by default.
 	BaseURL string
-	// LagHours is how far behind now an export window must end. The Logs API
-	// rejects date2 = today outright, and recent data keeps arriving for a
-	// while, so a window that ends too close to now returns partial results.
-	LagHours int
-	// MaxWindowHours caps a single export so a long outage is caught up in
-	// bounded steps instead of one request Metrika refuses on quota.
-	MaxWindowHours int
+	// SettleMinutes is how long data is left to settle before it is judged.
+	// Metrika keeps counting sessions for a short while after they happen, so
+	// measuring right up to the present reads low.
+	SettleMinutes int
+	// WindowMinutes is how much traffic one measurement covers. An hour keeps
+	// the figure stable; the window still advances every StepMinutes.
+	WindowMinutes int
+	// StepMinutes is how far the window advances per check, and the granularity
+	// requested from the API.
+	StepMinutes int
+	// MaxCatchUpSteps bounds how many missed windows one tick works through, so
+	// a counter idle for a week does not fire a burst of stale alerts at once.
+	MaxCatchUpSteps int
 }
 
 // Defaults for MetrikaConfig.
 const (
-	DefaultLagHours       = 26
-	DefaultMaxWindowHours = 24
+	DefaultSettleMinutes   = 20
+	DefaultWindowMinutes   = 60
+	DefaultStepMinutes     = 10
+	DefaultMaxCatchUpSteps = 6
 )
 
-func (c *MetrikaConfig) lag() time.Duration {
-	if c.LagHours <= 0 {
-		return DefaultLagHours * time.Hour
+func (c *MetrikaConfig) settle() time.Duration {
+	if c.SettleMinutes <= 0 {
+		return DefaultSettleMinutes * time.Minute
 	}
-	return time.Duration(c.LagHours) * time.Hour
+	return time.Duration(c.SettleMinutes) * time.Minute
 }
 
-func (c *MetrikaConfig) maxWindow() time.Duration {
-	if c.MaxWindowHours <= 0 {
-		return DefaultMaxWindowHours * time.Hour
+func (c *MetrikaConfig) window() time.Duration {
+	if c.WindowMinutes <= 0 {
+		return DefaultWindowMinutes * time.Minute
 	}
-	return time.Duration(c.MaxWindowHours) * time.Hour
+	return time.Duration(c.WindowMinutes) * time.Minute
 }
 
-func NewPoller(db *model.DB, cfg *MetrikaConfig, consumer EventConsumer) *Poller {
-	return &Poller{db: db, cfg: cfg, consumer: consumer}
+// step is both the cadence and the API granularity, so the two can never drift
+// apart into windows that do not line up with the buckets they are summed from.
+func (c *MetrikaConfig) step() time.Duration {
+	if c.StepMinutes <= 0 {
+		return DefaultStepMinutes * time.Minute
+	}
+	return time.Duration(c.StepMinutes) * time.Minute
 }
 
-// staleAfter is how long an export may sit untouched before it is abandoned.
-// A process killed mid-flight leaves one behind; nothing will ever download it.
-const staleAfter = 6 * time.Hour
+func (c *MetrikaConfig) maxCatchUp() int {
+	if c.MaxCatchUpSteps <= 0 {
+		return DefaultMaxCatchUpSteps
+	}
+	return c.MaxCatchUpSteps
+}
+
+func NewPoller(db *model.DB, cfg *MetrikaConfig, evaluator *Evaluator) *Poller {
+	return &Poller{db: db, cfg: cfg, evaluator: evaluator}
+}
 
 // Start launches one goroutine per counter and returns immediately.
 func (p *Poller) Start(ctx context.Context) error {
@@ -90,10 +100,6 @@ func (p *Poller) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list counters: %w", err)
 	}
-
-	// Exports orphaned by an earlier run hold quota that new ones need.
-	p.reapStaleRequests(ctx, counters)
-
 	if len(counters) == 0 {
 		log.Printf("poller started: no counters configured — add one with /addcounter")
 		return nil
@@ -102,45 +108,11 @@ func (p *Poller) Start(ctx context.Context) error {
 	for _, c := range counters {
 		go p.pollCounterLoop(ctx, c)
 	}
-	log.Printf("poller started: %d counter(s), export window ends %s behind now",
-		len(counters), p.cfg.lag())
+	log.Printf("poller started: %d counter(s), %s window stepped every %s, %s to settle",
+		len(counters), p.cfg.window(), p.cfg.step(), p.cfg.settle())
 	return nil
 }
 
-// reapStaleRequests cancels exports left behind by a previous process.
-func (p *Poller) reapStaleRequests(ctx context.Context, counters []model.Counter) {
-	stale, err := p.db.StaleLogRequests(ctx, time.Now().Add(-staleAfter))
-	if err != nil {
-		log.Printf("poller: list stale log requests: %v", err)
-		return
-	}
-
-	byID := make(map[int64]model.Counter, len(counters))
-	for _, c := range counters {
-		byID[c.ID] = c
-	}
-
-	for _, r := range stale {
-		counter, ok := byID[r.CounterID]
-		if !ok {
-			p.db.DeleteLogRequest(ctx, r.ID)
-			continue
-		}
-		client := NewLogsClient(&counter, p.cfg.BaseURL)
-		// Best effort: Metrika may have expired it already, and either way the
-		// local row must go so the next tick can order a fresh export.
-		if err := client.Cancel(ctx, r.RequestID); err != nil {
-			log.Printf("poller: cancel stale export %d for counter %s: %v", r.RequestID, counter.CounterID, err)
-		}
-		if err := p.db.DeleteLogRequest(ctx, r.ID); err != nil {
-			log.Printf("poller: drop stale export %d: %v", r.RequestID, err)
-		} else {
-			log.Printf("poller: abandoned stale export %d for counter %s", r.RequestID, counter.CounterID)
-		}
-	}
-}
-
-// pollCounterLoop advances one counter's state machine at its interval.
 func (p *Poller) pollCounterLoop(ctx context.Context, c model.Counter) {
 	interval := time.Duration(c.PollInterval) * time.Minute
 	if interval < time.Minute {
@@ -162,187 +134,77 @@ func (p *Poller) pollCounterLoop(ctx context.Context, c model.Counter) {
 	}
 }
 
-// advance moves one counter one step through the export lifecycle.
+// advance judges every window a counter has not seen yet.
 func (p *Poller) advance(ctx context.Context, counterID int64) error {
-	// Re-read the counter each tick: its watermark moves, and its token or
+	// Re-read the counter each tick: its cursor moves, and its token or
 	// interval may have been changed through the bot or the API.
 	counter, err := p.db.GetCounter(ctx, counterID)
 	if err != nil {
 		return err
 	}
-	client := NewLogsClient(counter, p.cfg.BaseURL)
 
-	pending, err := p.db.PendingLogRequest(ctx, counterID)
-	if err != nil {
-		return err
-	}
-	if pending != nil {
-		return p.advancePending(ctx, counter, client, pending)
-	}
-	return p.orderExport(ctx, counter, client)
-}
-
-// advancePending checks an in-flight export and consumes it once ready.
-func (p *Poller) advancePending(ctx context.Context, counter *model.Counter, client *LogsClient, pending *model.LogRequest) error {
-	req, err := client.Get(ctx, pending.RequestID)
-	if err != nil {
-		return fmt.Errorf("check export %d: %w", pending.RequestID, err)
+	windows := p.pendingWindows(counter, time.Now())
+	if len(windows) == 0 {
+		return nil
 	}
 
-	if req.Status != pending.Status {
-		if err := p.db.UpdateLogRequestStatus(ctx, pending.ID, req.Status); err != nil {
+	for _, end := range windows {
+		fired, err := p.evaluator.EvaluateWindow(ctx, counter, end)
+		if err != nil {
+			// Leave the cursor where it is so the window is retried rather than
+			// silently skipped.
+			return fmt.Errorf("judge window ending %s: %w", end.Format("2006-01-02 15:04"), err)
+		}
+		if err := p.db.SetLastHourChecked(ctx, counter.ID, end); err != nil {
 			return err
 		}
-	}
-
-	switch {
-	case req.Ready():
-		return p.consumeExport(ctx, counter, client, pending, req)
-
-	case req.Terminal():
-		// Nothing will come of it. Drop the row so the next tick orders again
-		// for the same window — no events are skipped.
-		log.Printf("counter %s: export %d ended as %q, will re-order",
-			counter.CounterID, req.RequestID, req.Status)
-		return p.db.DeleteLogRequest(ctx, pending.ID)
-
-	default:
-		// Still created or awaiting_retry: preparation takes minutes.
-		return nil
-	}
-}
-
-// consumeExport downloads a processed export, evaluates it and advances the
-// watermark.
-func (p *Poller) consumeExport(ctx context.Context, counter *model.Counter, client *LogsClient, pending *model.LogRequest, req *LogRequest) error {
-	since := time.Time{}
-	if counter.LastEventAt != nil {
-		since = *counter.LastEventAt
-	}
-
-	var events []*model.MetrikaEvent
-	newest := since
-
-	err := client.DownloadEvents(ctx, req, func(ev *model.MetrikaEvent) error {
-		// The export window is inclusive at both ends, so its first events are
-		// the ones the previous export already delivered.
-		if !since.IsZero() && !ev.EventTime.After(since) {
-			return nil
-		}
-		if ev.EventTime.After(newest) {
-			newest = ev.EventTime
-		}
-		events = append(events, ev)
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("download export %d: %w", req.RequestID, err)
-	}
-
-	if len(events) > 0 {
-		if err := p.consumer(counter.ID, events); err != nil {
-			// Leave the export in place: the next tick retries the download
-			// rather than dropping a batch that was never evaluated.
-			return fmt.Errorf("evaluate %d event(s): %w", len(events), err)
+		if fired > 0 {
+			log.Printf("counter %s: window ending %s fired %d alert(s)",
+				counter.CounterID, end.Format("2006-01-02 15:04"), fired)
 		}
 	}
-
-	// The window is fully processed even when it held nothing for us, so the
-	// watermark advances to its end and the next export starts after it.
-	watermark := pending.Date2
-	if newest.After(watermark) {
-		watermark = newest
-	}
-	if err := p.db.SetCounterWatermark(ctx, counter.ID, watermark); err != nil {
-		return err
-	}
-
-	log.Printf("counter %s: export %d delivered %d event(s), window through %s",
-		counter.CounterID, req.RequestID, len(events), watermark.Format(time.RFC3339))
-
-	// Release the quota before dropping the row, so a failure here still leaves
-	// something to reap.
-	if err := client.Clean(ctx, req.RequestID); err != nil {
-		log.Printf("counter %s: clean export %d: %v", counter.CounterID, req.RequestID, err)
-	}
-	return p.db.DeleteLogRequest(ctx, pending.ID)
-}
-
-// orderExport creates the next export for a counter, if the window is ripe.
-func (p *Poller) orderExport(ctx context.Context, counter *model.Counter, client *LogsClient) error {
-	window, ok := p.nextWindow(counter, time.Now())
-	if !ok {
-		// Not enough settled data has accumulated yet.
-		return nil
-	}
-
-	// Asking first turns a quota rejection into one clear log line instead of
-	// an export that is created and then fails.
-	eval, err := client.Evaluate(ctx, window)
-	if err != nil {
-		return err
-	}
-	if !eval.Possible {
-		return fmt.Errorf("Metrika will not export %s → %s (quota allows %d day(s))",
-			window.From.Format(time.RFC3339), window.To.Format(time.RFC3339), eval.MaxPossibleDays)
-	}
-
-	req, err := client.Create(ctx, window)
-	if err != nil {
-		return err
-	}
-
-	record := &model.LogRequest{
-		CounterID: counter.ID,
-		RequestID: req.RequestID,
-		Date1:     window.From,
-		Date2:     window.To,
-		Status:    req.Status,
-	}
-	if err := p.db.CreateLogRequest(ctx, record); err != nil {
-		// The export exists at Metrika but is not tracked here. Cancel it now
-		// rather than leaving quota held by something nothing will download.
-		if cancelErr := client.Cancel(ctx, req.RequestID); cancelErr != nil {
-			log.Printf("counter %s: could not cancel untracked export %d: %v",
-				counter.CounterID, req.RequestID, cancelErr)
-		}
-		return err
-	}
-
-	log.Printf("counter %s: ordered export %d for %s → %s",
-		counter.CounterID, req.RequestID,
-		window.From.Format(time.RFC3339), window.To.Format(time.RFC3339))
 	return nil
 }
 
-// nextWindow computes the period the next export should cover, or reports that
-// it is too early to ask for one.
-func (p *Poller) nextWindow(counter *model.Counter, now time.Time) (Window, bool) {
-	// Everything up to this point is settled enough to export.
-	end := now.Add(-p.cfg.lag())
+// pendingWindows lists the window ends a counter still owes, oldest first.
+func (p *Poller) pendingWindows(counter *model.Counter, now time.Time) []time.Time {
+	step := p.cfg.step()
 
-	// Resume from the watermark however far back it sits. Clamping the start
-	// forward instead would silently skip every event in between — a counter
-	// idle for a month would lose the month.
-	start := end.Add(-p.cfg.maxWindow())
-	if counter.LastEventAt != nil {
-		start = *counter.LastEventAt
+	// The newest window end whose data has settled. Everything up to this point
+	// is counted; measuring closer to the present reads low.
+	latest := truncateTo(now.Add(-p.cfg.settle()), step)
+
+	// A counter with no cursor starts at the latest window rather than replaying
+	// history: those windows are past and alerting on them helps nobody.
+	if counter.LastHourChecked == nil {
+		return []time.Time{latest}
 	}
 
-	if !end.After(start) {
-		return Window{}, false
+	var windows []time.Time
+	for end := truncateTo(*counter.LastHourChecked, step).Add(step); !end.After(latest); end = end.Add(step) {
+		windows = append(windows, end)
+		if len(windows) >= p.cfg.maxCatchUp() {
+			break
+		}
 	}
-	// Cap one export instead: a counter far behind is walked forward a window
-	// per tick until it catches up.
-	if end.Sub(start) > p.cfg.maxWindow() {
-		end = start.Add(p.cfg.maxWindow())
-	}
-	return Window{From: start, To: end}, true
+	return windows
 }
 
-// RunOnce advances every counter a single step. Used by the /poll command and
-// the REST API; because the API is asynchronous this usually orders an export
-// rather than delivering events immediately.
+// truncateTo rounds t down to a multiple of step within the day. time.Truncate
+// works on absolute time, which drifts against local wall-clock slots when the
+// zone offset is not a whole number of hours.
+func truncateTo(t time.Time, step time.Duration) time.Time {
+	minutes := t.Hour()*60 + t.Minute()
+	stepMinutes := int(step / time.Minute)
+	if stepMinutes <= 0 {
+		stepMinutes = 1
+	}
+	aligned := minutes - minutes%stepMinutes
+
+	return time.Date(t.Year(), t.Month(), t.Day(), aligned/60, aligned%60, 0, 0, t.Location())
+}
+
+// RunOnce advances every counter a single step. Used by /poll and the REST API.
 func (p *Poller) RunOnce(ctx context.Context) error {
 	counters, err := p.db.ListCounters(ctx)
 	if err != nil {

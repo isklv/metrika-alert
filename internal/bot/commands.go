@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/isklv/metrika-alert/internal/engine"
 )
 
 func (b *Bot) sendMenu(ctx context.Context, chatID string) {
@@ -14,11 +16,7 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /addcounter — добавить счётчик Метрики
 /deletecounter <id> — удалить счётчик
 
-/monitors <counter_id> — страницы мониторинга
-/addmonitor <counter_id> — добавить страницу
-/deletemonitor <id> — удалить страницу
-
-/triggers <counter_id> — триггеры алертов
+/triggers <counter_id> — правила алертов
 /addtrigger <counter_id> — создать триггер
 /deletetrigger <id> — удалить триггер
 
@@ -69,50 +67,7 @@ func (b *Bot) deleteCounter(ctx context.Context, chatID, args string) {
 		b.replyErr(ctx, chatID, err)
 		return
 	}
-	b.reply(ctx, chatID, fmt.Sprintf("✅ Счётчик *%s* удалён вместе с его мониторами, триггерами и историей", c.Name))
-}
-
-// ---- Monitors ----
-
-func (b *Bot) listMonitors(ctx context.Context, chatID, args string) {
-	id, ok := b.parseID(ctx, chatID, args, "/monitors 1")
-	if !ok {
-		return
-	}
-	c, err := b.db.GetCounter(ctx, id)
-	if err != nil {
-		b.reply(ctx, chatID, "❌ Счётчик не найден")
-		return
-	}
-	monitors, err := b.db.ListMonitors(ctx, id)
-	if err != nil {
-		b.replyErr(ctx, chatID, err)
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("*Страницы мониторинга — %s:*\n\n", c.Name))
-	if len(monitors) == 0 {
-		sb.WriteString(fmt.Sprintf("_Нет страниц. Добавь: /addmonitor %d_", id))
-	} else {
-		for _, m := range monitors {
-			sb.WriteString(fmt.Sprintf("• #%d %s *%s* — `%s` [%s]\n",
-				m.ID, enabledMark(m.Enabled), m.Name, m.URLPattern, strings.Join(m.Metrics, ", ")))
-		}
-	}
-	b.reply(ctx, chatID, sb.String())
-}
-
-func (b *Bot) deleteMonitor(ctx context.Context, chatID, args string) {
-	id, ok := b.parseID(ctx, chatID, args, "/deletemonitor 1")
-	if !ok {
-		return
-	}
-	if err := b.db.DeleteMonitor(ctx, id); err != nil {
-		b.replyErr(ctx, chatID, err)
-		return
-	}
-	b.reply(ctx, chatID, "✅ Монитор удалён")
+	b.reply(ctx, chatID, fmt.Sprintf("✅ Счётчик *%s* удалён вместе с его правилами и историей", c.Name))
 }
 
 // ---- Triggers ----
@@ -139,12 +94,10 @@ func (b *Bot) listTriggers(ctx context.Context, chatID, args string) {
 		sb.WriteString(fmt.Sprintf("_Нет триггеров. Добавь: /addtrigger %d_", id))
 	} else {
 		for _, t := range triggers {
-			scope := "весь счётчик"
-			if t.MonitorID != nil {
-				scope = fmt.Sprintf("monitor #%d", *t.MonitorID)
-			}
-			sb.WriteString(fmt.Sprintf("• #%d %s *%s* — `%s` (порог %d за %d мин, кулдаун %d мин) [%s]\n",
-				t.ID, enabledMark(t.Enabled), t.Name, t.Condition, t.Threshold, t.Window, t.Cooldown, scope))
+			sb.WriteString(fmt.Sprintf("• #%d %s *%s*\n    %s %s на %d%%+ от обычного для этого часа\n    база %d нед., мин. %d, кулдаун %d мин\n",
+				t.ID, enabledMark(t.Enabled), t.Name,
+				engine.MetricLabel(t.Metric), directionLabel(t.Direction),
+				t.DeviationPct, t.BaselineWeeks, t.MinBaseline, t.Cooldown))
 		}
 	}
 	b.reply(ctx, chatID, sb.String())
@@ -289,6 +242,18 @@ func (b *Bot) parseID(ctx context.Context, chatID, args, usage string) (int64, b
 
 func (b *Bot) replyErr(ctx context.Context, chatID string, err error) {
 	b.reply(ctx, chatID, "❌ Ошибка: "+err.Error())
+}
+
+// directionLabel renders which way a trigger watches.
+func directionLabel(direction string) string {
+	switch direction {
+	case engine.DirectionDrop:
+		return "падают"
+	case engine.DirectionRise:
+		return "растут"
+	default:
+		return "меняются"
+	}
 }
 
 func enabledMark(enabled bool) string {

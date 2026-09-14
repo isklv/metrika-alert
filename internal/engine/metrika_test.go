@@ -19,8 +19,8 @@ func TestAPIErrorCarriesMetrikaDetail(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewLogsClient(testCounter(), srv.URL)
-	_, err := c.Get(context.Background(), 1)
+	c := NewReportClient(testCounter(), srv.URL)
+	_, err := c.Goals(context.Background())
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -48,17 +48,17 @@ func TestRetriesQuotaAndServerFaults(t *testing.T) {
 			fmt.Fprint(w, `{"message":"Quota exceeded"}`)
 			return
 		}
-		fmt.Fprint(w, `{"log_request":{"request_id":1,"status":"processed"}}`)
+		fmt.Fprint(w, `{"goals":[{"id":42,"name":"Покупка"}]}`)
 	}))
 	defer srv.Close()
 
-	c := NewLogsClient(testCounter(), srv.URL)
-	req, err := c.Get(context.Background(), 1)
+	c := NewReportClient(testCounter(), srv.URL)
+	goals, err := c.Goals(context.Background())
 	if err != nil {
-		t.Fatalf("Get after a 429: %v", err)
+		t.Fatalf("Goals after a 429: %v", err)
 	}
-	if !req.Ready() {
-		t.Errorf("status = %q", req.Status)
+	if len(goals) != 1 {
+		t.Errorf("goals = %+v", goals)
 	}
 	if n := calls.Load(); n != 2 {
 		t.Errorf("made %d calls, want 2 (one retry)", n)
@@ -74,8 +74,8 @@ func TestDoesNotRetryClientErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewLogsClient(testCounter(), srv.URL)
-	if _, err := c.Get(context.Background(), 1); err == nil {
+	c := NewReportClient(testCounter(), srv.URL)
+	if _, err := c.Goals(context.Background()); err == nil {
 		t.Fatal("expected an error")
 	}
 	// Retrying a request the API will never accept only wastes quota.
@@ -93,8 +93,8 @@ func TestCancelledContextStopsImmediately(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	c := NewLogsClient(testCounter(), srv.URL)
-	if _, err := c.Get(ctx, 1); !errors.Is(err, context.Canceled) {
+	c := NewReportClient(testCounter(), srv.URL)
+	if _, err := c.Goals(ctx); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }

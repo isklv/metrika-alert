@@ -175,23 +175,46 @@ func TestDefaultMetrikaHostIsTheDocumentedOne(t *testing.T) {
 	if cfg.Metrika.BaseURL != "https://api-metrika.yandex.net" {
 		t.Errorf("base_url = %q", cfg.Metrika.BaseURL)
 	}
-	if cfg.Metrika.LagHours < 24 {
-		t.Errorf("lag_hours = %d — the Logs API refuses a window ending today", cfg.Metrika.LagHours)
+	if cfg.Metrika.SettleMinutes <= 0 {
+		t.Errorf("settle_minutes = %d — a closed hour needs time to settle before it is judged", cfg.Metrika.SettleMinutes)
 	}
 }
 
-func TestLogsPacingOverrides(t *testing.T) {
-	t.Setenv("METRIKA_LAG_HOURS", "48")
-	t.Setenv("METRIKA_MAX_WINDOW_HOURS", "6")
+func TestMeasurementPacingOverrides(t *testing.T) {
+	t.Setenv("METRIKA_SETTLE_MINUTES", "45")
+	t.Setenv("METRIKA_WINDOW_MINUTES", "120")
+	t.Setenv("METRIKA_STEP_MINUTES", "30")
+	t.Setenv("METRIKA_MAX_CATCH_UP_STEPS", "3")
 
-	cfg, err := Load(writeConfig(t, "metrika:\n  lag_hours: 30\n"))
+	cfg, err := Load(writeConfig(t, "metrika:\n  settle_minutes: 15\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Metrika.LagHours != 48 {
-		t.Errorf("lag_hours = %d, want the env override", cfg.Metrika.LagHours)
+	if cfg.Metrika.SettleMinutes != 45 {
+		t.Errorf("settle_minutes = %d, want the env override", cfg.Metrika.SettleMinutes)
 	}
-	if cfg.Metrika.MaxWindowHours != 6 {
-		t.Errorf("max_window_hours = %d", cfg.Metrika.MaxWindowHours)
+	if cfg.Metrika.WindowMinutes != 120 || cfg.Metrika.StepMinutes != 30 {
+		t.Errorf("window/step = %d/%d", cfg.Metrika.WindowMinutes, cfg.Metrika.StepMinutes)
+	}
+	if cfg.Metrika.MaxCatchUpSteps != 3 {
+		t.Errorf("max_catch_up_steps = %d", cfg.Metrika.MaxCatchUpSteps)
+	}
+}
+
+// The defaults are an hour of signal advancing every ten minutes.
+func TestMeasurementDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "database: x.db\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Metrika.WindowMinutes != 60 {
+		t.Errorf("window_minutes = %d, want 60", cfg.Metrika.WindowMinutes)
+	}
+	if cfg.Metrika.StepMinutes != 10 {
+		t.Errorf("step_minutes = %d, want 10", cfg.Metrika.StepMinutes)
+	}
+	// A window narrower than the step would leave gaps between measurements.
+	if cfg.Metrika.WindowMinutes < cfg.Metrika.StepMinutes {
+		t.Error("the window must be at least as wide as the step")
 	}
 }

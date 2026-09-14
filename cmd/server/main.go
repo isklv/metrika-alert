@@ -86,14 +86,14 @@ func main() {
 
 	// --- Engine -------------------------------------------------------------
 	metrikaCfg := &engine.MetrikaConfig{
-		BaseURL:        cfg.Metrika.BaseURL,
-		LagHours:       cfg.Metrika.LagHours,
-		MaxWindowHours: cfg.Metrika.MaxWindowHours,
+		BaseURL:         cfg.Metrika.BaseURL,
+		SettleMinutes:   cfg.Metrika.SettleMinutes,
+		WindowMinutes:   cfg.Metrika.WindowMinutes,
+		StepMinutes:     cfg.Metrika.StepMinutes,
+		MaxCatchUpSteps: cfg.Metrika.MaxCatchUpSteps,
 	}
-	eval := engine.NewEvaluator(db, router)
-	poller := engine.NewPoller(db, metrikaCfg, func(counterID int64, events []*model.MetrikaEvent) error {
-		return eval.Evaluate(context.Background(), counterID, events)
-	})
+	evaluator := engine.NewEvaluator(db, router, metrikaCfg)
+	poller := engine.NewPoller(db, metrikaCfg, evaluator)
 	reporter := engine.NewReporter(db, metrikaCfg, router)
 
 	if err := poller.Start(ctx); err != nil {

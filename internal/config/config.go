@@ -39,12 +39,18 @@ type MetrikaCfg struct {
 	// BaseURL serves both the Reporting API (/stat/v1/data) and the Logs API
 	// (/management/v1/...), so one host covers everything.
 	BaseURL string `yaml:"base_url"`
-	// LagHours is how far behind now a Logs API export window ends. The API
-	// refuses a window ending today, and recent data keeps settling, so this
-	// cannot usefully drop below about a day.
-	LagHours int `yaml:"lag_hours"`
-	// MaxWindowHours caps one export, bounding catch-up after an outage.
-	MaxWindowHours int `yaml:"max_window_hours"`
+	// SettleMinutes is how long data is left to settle before it is judged.
+	// Metrika keeps counting sessions for a short while after they happen, so
+	// measuring right up to the present reads low.
+	SettleMinutes int `yaml:"settle_minutes"`
+	// WindowMinutes is how much traffic one measurement covers.
+	WindowMinutes int `yaml:"window_minutes"`
+	// StepMinutes is how often the window advances, and so how quickly a drop
+	// is noticed.
+	StepMinutes int `yaml:"step_minutes"`
+	// MaxCatchUpSteps bounds how many missed windows one check works through,
+	// so a counter idle for a week does not fire a burst of stale alerts.
+	MaxCatchUpSteps int `yaml:"max_catch_up_steps"`
 }
 
 type APICfg struct {
@@ -65,11 +71,12 @@ var legacyMetrikaHosts = map[string]bool{
 	"https://logs.metrika.yandex.ru": true,
 }
 
-// Logs API export pacing defaults. The API rejects a window ending on the
-// current day, so the lag is a property of the API, not a tuning preference.
+// Measurement defaults: an hour-wide window advancing every ten minutes.
 const (
-	DefaultLagHours       = 26
-	DefaultMaxWindowHours = 24
+	DefaultSettleMinutes   = 20
+	DefaultWindowMinutes   = 60
+	DefaultStepMinutes     = 10
+	DefaultMaxCatchUpSteps = 6
 )
 
 // DefaultVKTeamsURL is the VK Teams cloud bot API. On-premise installations
@@ -89,8 +96,10 @@ const DefaultVKTeamsURL = "https://myteam.mail.ru/bot/v1"
 //	METRIKA_VKTEAMS_ADMINS  — comma-separated VK Teams admin user IDs
 //	METRIKA_VKTEAMS_PROXY   — proxy URL for VK Teams
 //	METRIKA_METRIKA_BASE    — metrika API base URL
-//	METRIKA_LAG_HOURS       — how far behind now a Logs API export window ends
-//	METRIKA_MAX_WINDOW_HOURS — largest single export window
+//	METRIKA_SETTLE_MINUTES  — delay before a closed hour is judged
+//	METRIKA_WINDOW_MINUTES  — width of one measurement window
+//	METRIKA_STEP_MINUTES    — how often the window advances
+//	METRIKA_MAX_CATCH_UP_STEPS — how many missed windows one check works through
 //	METRIKA_API_LISTEN      — REST API listen address
 //	METRIKA_API_ENABLED     — "true" to enable the REST API
 //	METRIKA_API_TOKEN       — bearer token required by the REST API
@@ -122,11 +131,17 @@ func applyDefaults(c *Config) {
 		}
 		c.Metrika.BaseURL = DefaultMetrikaURL
 	}
-	if c.Metrika.LagHours <= 0 {
-		c.Metrika.LagHours = DefaultLagHours
+	if c.Metrika.SettleMinutes <= 0 {
+		c.Metrika.SettleMinutes = DefaultSettleMinutes
 	}
-	if c.Metrika.MaxWindowHours <= 0 {
-		c.Metrika.MaxWindowHours = DefaultMaxWindowHours
+	if c.Metrika.WindowMinutes <= 0 {
+		c.Metrika.WindowMinutes = DefaultWindowMinutes
+	}
+	if c.Metrika.StepMinutes <= 0 {
+		c.Metrika.StepMinutes = DefaultStepMinutes
+	}
+	if c.Metrika.MaxCatchUpSteps <= 0 {
+		c.Metrika.MaxCatchUpSteps = DefaultMaxCatchUpSteps
 	}
 	if c.VKTeams.BaseURL == "" {
 		c.VKTeams.BaseURL = DefaultVKTeamsURL
@@ -179,14 +194,24 @@ func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("METRIKA_METRIKA_BASE"); v != "" {
 		c.Metrika.BaseURL = v
 	}
-	if v := os.Getenv("METRIKA_LAG_HOURS"); v != "" {
-		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h > 0 {
-			c.Metrika.LagHours = h
+	if v := os.Getenv("METRIKA_SETTLE_MINUTES"); v != "" {
+		if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+			c.Metrika.SettleMinutes = m
 		}
 	}
-	if v := os.Getenv("METRIKA_MAX_WINDOW_HOURS"); v != "" {
-		if h, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && h > 0 {
-			c.Metrika.MaxWindowHours = h
+	if v := os.Getenv("METRIKA_WINDOW_MINUTES"); v != "" {
+		if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+			c.Metrika.WindowMinutes = m
+		}
+	}
+	if v := os.Getenv("METRIKA_STEP_MINUTES"); v != "" {
+		if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && m > 0 {
+			c.Metrika.StepMinutes = m
+		}
+	}
+	if v := os.Getenv("METRIKA_MAX_CATCH_UP_STEPS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			c.Metrika.MaxCatchUpSteps = n
 		}
 	}
 	if v := os.Getenv("METRIKA_API_LISTEN"); v != "" {

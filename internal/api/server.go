@@ -80,7 +80,6 @@ func (s *Server) withAuth(h http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/counters", s.withAuth(s.handleCounters))
-	s.mux.HandleFunc("/api/monitors", s.withAuth(s.handleMonitors))
 	s.mux.HandleFunc("/api/triggers", s.withAuth(s.handleTriggers))
 	s.mux.HandleFunc("/api/alert-actions", s.withAuth(s.handleAlertActions))
 	s.mux.HandleFunc("/api/alerts", s.withAuth(s.handleAlerts))
@@ -118,6 +117,13 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Defaults applied to a rule created through the API, matching the bot's.
+const (
+	defaultMinBaseline     = 10
+	defaultBaselineWeeks   = 4
+	defaultCooldownMinutes = 180
+)
 
 // ---- handlers ----
 
@@ -167,65 +173,6 @@ func (s *Server) createCounter(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(c)
 }
 
-func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request) {
-	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
-	switch r.Method {
-	case http.MethodGet:
-		if counterID <= 0 {
-			http.Error(w, "counter_id required", http.StatusBadRequest)
-			return
-		}
-		data, err := s.db.ListMonitors(r.Context(), counterID)
-		s.getJSON(w, data, err)
-	case http.MethodPost:
-		body, err := readBody(r)
-		if err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		if counterID <= 0 {
-			counterID = bodyInt64(body, "counter_id")
-		}
-		s.createMonitor(w, r, body, counterID)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request, raw []byte, counterID int64) {
-	var body struct {
-		Name       string   `json:"name"`
-		URLPattern string   `json:"url_pattern"`
-		Metrics    []string `json:"metrics"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if body.Name == "" || body.URLPattern == "" || counterID <= 0 {
-		http.Error(w, "counter_id, name, url_pattern required", http.StatusBadRequest)
-		return
-	}
-	if len(body.Metrics) == 0 {
-		body.Metrics = []string{"visits", "bounces", "goals", "revenue"}
-	}
-
-	m := &model.PageMonitor{
-		CounterID:  counterID,
-		Name:       body.Name,
-		URLPattern: body.URLPattern,
-		Metrics:    body.Metrics,
-		Enabled:    true,
-	}
-	if err := s.db.CreateMonitor(r.Context(), m); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(m)
-}
-
 func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request) {
 	counterID := parseOptionalInt64(r.URL.Query().Get("counter_id"))
 	switch r.Method {
@@ -253,35 +200,59 @@ func (s *Server) handleTriggers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createTrigger(w http.ResponseWriter, r *http.Request, raw []byte, counterID int64) {
 	var body struct {
-		Name            string `json:"name"`
-		MonitorID       *int64 `json:"monitor_id,omitempty"`
-		Condition       string `json:"condition"`
-		Threshold       int    `json:"threshold"`
-		WindowMinutes   int    `json:"window_minutes"`
-		CooldownMinutes int    `json:"cooldown_minutes"`
+		Name          string `json:"name"`
+		Metric        string `json:"metric"`
+		Direction     string `json:"direction"`
+		DeviationPct  int    `json:"deviation_percent"`
+		MinBaseline   *int   `json:"min_baseline,omitempty"`
+		BaselineWeeks int    `json:"baseline_weeks"`
+		Cooldown      int    `json:"cooldown_minutes"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if body.Name == "" || body.Condition == "" || counterID <= 0 {
-		http.Error(w, "counter_id, name, condition required", http.StatusBadRequest)
+	if body.Name == "" || counterID <= 0 {
+		http.Error(w, "counter_id and name required", http.StatusBadRequest)
 		return
 	}
-	if body.Threshold <= 0 {
-		body.Threshold = 1
+	if _, err := engine.ResolveMetric(body.Metric); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	if body.WindowMinutes <= 0 {
-		body.WindowMinutes = 30
+	if body.Direction == "" {
+		body.Direction = engine.DirectionDrop
 	}
-	if body.CooldownMinutes <= 0 {
-		body.CooldownMinutes = 60
+	if !engine.ValidDirection(body.Direction) {
+		http.Error(w, "direction must be drop, rise or both", http.StatusBadRequest)
+		return
+	}
+	if body.DeviationPct <= 0 || body.DeviationPct > 100 {
+		http.Error(w, "deviation_percent must be between 1 and 100", http.StatusBadRequest)
+		return
+	}
+	if body.BaselineWeeks <= 0 {
+		body.BaselineWeeks = defaultBaselineWeeks
+	}
+	if body.Cooldown <= 0 {
+		body.Cooldown = defaultCooldownMinutes
+	}
+	// A zero floor is a deliberate choice, so only an absent field defaults.
+	minBaseline := defaultMinBaseline
+	if body.MinBaseline != nil {
+		minBaseline = *body.MinBaseline
 	}
 
 	t := &model.Trigger{
-		CounterID: counterID, MonitorID: body.MonitorID, Name: body.Name,
-		Condition: body.Condition, Threshold: body.Threshold,
-		Window: body.WindowMinutes, Cooldown: body.CooldownMinutes, Enabled: true,
+		CounterID:     counterID,
+		Name:          body.Name,
+		Metric:        strings.ToLower(body.Metric),
+		Direction:     body.Direction,
+		DeviationPct:  body.DeviationPct,
+		MinBaseline:   minBaseline,
+		BaselineWeeks: body.BaselineWeeks,
+		Cooldown:      body.Cooldown,
+		Enabled:       true,
 	}
 	if err := s.db.CreateTrigger(r.Context(), t); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

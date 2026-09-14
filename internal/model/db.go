@@ -9,56 +9,43 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schema = `
+// schemaTriggers and schemaCooldowns are separate so the migration can rebuild
+// them without restating the DDL.
+const schemaTriggers = `
+CREATE TABLE IF NOT EXISTS triggers (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	counter_id INTEGER NOT NULL REFERENCES counters(id),
+	name TEXT NOT NULL,
+	metric TEXT NOT NULL,
+	direction TEXT NOT NULL DEFAULT 'drop' CHECK(direction IN ('drop','rise','both')),
+	deviation_percent INTEGER NOT NULL DEFAULT 30,
+	min_baseline INTEGER NOT NULL DEFAULT 10,
+	baseline_weeks INTEGER NOT NULL DEFAULT 4,
+	cooldown_minutes INTEGER NOT NULL DEFAULT 180,
+	enabled BOOLEAN NOT NULL DEFAULT 1,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
+
+const schemaCooldowns = `
+CREATE TABLE IF NOT EXISTS trigger_cooldowns (
+	trigger_id INTEGER PRIMARY KEY REFERENCES triggers(id),
+	last_fired_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
+
+const schema = schemaTriggers + schemaCooldowns + `
 CREATE TABLE IF NOT EXISTS counters (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT NOT NULL,
 	counter_id TEXT UNIQUE NOT NULL,
 	oauth_token TEXT NOT NULL,
 	poll_interval_minutes INTEGER NOT NULL DEFAULT 60,
-	-- Newest event already evaluated, so a restart does not replay history.
-	last_event_at DATETIME,
+	-- Start of the most recent hour already judged, so a restart neither
+	-- re-alerts on it nor skips the hours in between.
+	last_hour_checked DATETIME,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- The Logs API is asynchronous: an export is ordered, prepared over minutes,
--- then downloaded. The order has to outlive the poll that placed it and the
--- process itself — an untracked request is one Metrika keeps counting against
--- the counter's quota while nothing ever downloads or cleans it.
-CREATE TABLE IF NOT EXISTS log_requests (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	counter_id INTEGER NOT NULL REFERENCES counters(id),
-	request_id INTEGER NOT NULL,
-	date1 DATETIME NOT NULL,
-	date2 DATETIME NOT NULL,
-	status TEXT NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-	UNIQUE(counter_id, request_id)
-);
 
-CREATE TABLE IF NOT EXISTS page_monitors (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	counter_id INTEGER NOT NULL REFERENCES counters(id),
-	name TEXT NOT NULL,
-	url_pattern TEXT NOT NULL,
-	metrics TEXT NOT NULL DEFAULT 'visits,bounces,goals,revenue',
-	enabled BOOLEAN NOT NULL DEFAULT 1,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS triggers (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	counter_id INTEGER NOT NULL REFERENCES counters(id),
-	monitor_id INTEGER REFERENCES page_monitors(id),
-	name TEXT NOT NULL,
-	condition TEXT NOT NULL,
-	threshold INTEGER NOT NULL DEFAULT 1,
-	window_minutes INTEGER NOT NULL DEFAULT 30,
-	cooldown_minutes INTEGER NOT NULL DEFAULT 60,
-	enabled BOOLEAN NOT NULL DEFAULT 1,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
 
 CREATE TABLE IF NOT EXISTS alert_actions (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +70,6 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE TABLE IF NOT EXISTS report_snapshots (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	counter_id INTEGER NOT NULL REFERENCES counters(id),
-	monitor_id INTEGER REFERENCES page_monitors(id),
 	period TEXT NOT NULL CHECK(period IN ('hour','day')),
 	period_key TEXT NOT NULL,
 	taken_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -97,13 +83,8 @@ CREATE TABLE IF NOT EXISTS report_snapshots (
 	orders INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS trigger_cooldowns (
-	trigger_id INTEGER PRIMARY KEY REFERENCES triggers(id),
-	last_fired_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
 
 CREATE INDEX IF NOT EXISTS idx_alerts_counter ON alerts(counter_id);
-CREATE INDEX IF NOT EXISTS idx_log_requests_counter ON log_requests(counter_id, status);
 CREATE INDEX IF NOT EXISTS idx_snapshots_counter_period ON report_snapshots(counter_id, period, period_key);
 `
 
@@ -132,22 +113,100 @@ ALTER TABLE alert_actions_new RENAME TO alert_actions;
 // migrate brings an existing database up to the current schema. It is a no-op
 // on a database that CREATE TABLE just built in its final shape.
 func migrate(db *sql.DB) error {
-	var ddl string
-	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_actions'`).Scan(&ddl)
-	if err != nil {
-		return fmt.Errorf("inspect alert_actions: %w", err)
+	if err := migrateAlertActionsTable(db); err != nil {
+		return err
 	}
-	if !strings.Contains(ddl, "vkteams") {
-		if err := rebuildAlertActions(db); err != nil {
-			return err
+	if err := migrateTriggersTable(db); err != nil {
+		return err
+	}
+	// CREATE TABLE IF NOT EXISTS leaves an existing counters table untouched,
+	// so the hour cursor has to be added explicitly.
+	if err := addColumnIfMissing(db, "counters", "last_hour_checked", "DATETIME"); err != nil {
+		return err
+	}
+	return dropObsoleteTables(db)
+}
+
+func migrateAlertActionsTable(db *sql.DB) error {
+	ddl, err := tableDDL(db, "alert_actions")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(ddl, "vkteams") {
+		return nil
+	}
+	return rebuildAlertActions(db)
+}
+
+// migrateTriggersTable replaces the per-event trigger table with the metric
+// one. Old rows are dropped rather than converted: a condition like
+// "status_code == 500" counted individual hits from the Logs API and has no
+// equivalent among aggregated hourly metrics.
+func migrateTriggersTable(db *sql.DB) error {
+	ddl, err := tableDDL(db, "triggers")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(ddl, "deviation_percent") {
+		return nil
+	}
+
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM triggers`).Scan(&count)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin trigger migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Cooldowns and past alerts reference trigger IDs that will not exist.
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS trigger_cooldowns`,
+		`DROP TABLE triggers`,
+		strings.Replace(schemaTriggers, "IF NOT EXISTS ", "", 1),
+		schemaCooldowns,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate triggers: %w", err)
 		}
 	}
-	return addColumnIfMissing(db, "counters", "last_event_at", "DATETIME")
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit trigger migration: %w", err)
+	}
+
+	if count > 0 {
+		log.Printf("db migrated: %d event-condition trigger(s) removed — "+
+			"alerts now compare hourly metrics against the same hour last weeks; recreate them with /addtrigger", count)
+	} else {
+		log.Printf("db migrated: triggers now hold metric anomaly rules")
+	}
+	return nil
+}
+
+// dropObsoleteTables removes structures whose only consumer was the per-event
+// engine: page monitors scoped event conditions to a URL, and log_requests
+// tracked Logs API exports.
+func dropObsoleteTables(db *sql.DB) error {
+	for _, table := range []string{"page_monitors", "log_requests"} {
+		exists, err := tableExists(db, table)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if _, err := db.Exec(`DROP TABLE ` + table); err != nil {
+			return fmt.Errorf("drop %s: %w", table, err)
+		}
+		log.Printf("db migrated: %s dropped — it served the retired per-event engine", table)
+	}
+	return nil
 }
 
 // addColumnIfMissing brings an older table up to the current shape. SQLite
-// supports ALTER TABLE ADD COLUMN, so unlike the CHECK constraint above this
-// needs no table rebuild.
+// supports ALTER TABLE ADD COLUMN, so unlike a CHECK constraint this needs no
+// table rebuild.
 func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
 	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
@@ -173,6 +232,27 @@ func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
 	}
 	log.Printf("db migrated: %s.%s added", table, column)
 	return nil
+}
+
+func tableDDL(db *sql.DB, table string) (string, error) {
+	var ddl string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&ddl)
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", table, err)
+	}
+	return ddl, nil
+}
+
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	return true, nil
 }
 
 func rebuildAlertActions(db *sql.DB) error {

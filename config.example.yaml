@@ -28,23 +28,31 @@ vkteams:
 # --- Yandex.Metrika -----------------------------------------------------------
 # OAuth tokens are stored per counter in the database, not here.
 metrika:
-  # One host serves both APIs this service uses: the Reporting API
-  # (/stat/v1/data) for reports and the Logs API (/management/v1/...) for raw
-  # events. Note the .net domain — api-metrika.yandex.ru does not serve the API.
+  # The Reporting API host. Note the .net domain — api-metrika.yandex.ru does
+  # not serve the API.
   base_url: https://api-metrika.yandex.net
 
-  # How far behind now a Logs API export window ends.
-  #
-  # This is a property of the API, not a tuning preference: Metrika refuses a
-  # window ending on the current day, and recent data keeps settling for hours
-  # after that. Lowering this below ~26 makes exports fail or return partial
-  # data. It is also why event triggers alert on yesterday, not on right now —
-  # see DEPLOY.md §6.
-  lag_hours: 26
+  # How long data is left to settle before it is judged. Metrika keeps counting
+  # sessions for a short while after they happen, so measuring right up to the
+  # present reads low and would fire false drops.
+  settle_minutes: 20
 
-  # Largest single export. A counter that fell behind is caught up one window
-  # per poll rather than in one request Metrika would refuse on quota.
-  max_window_hours: 24
+  # Width of one measurement window, and how often it advances.
+  #
+  # The window is an hour wide but moves every ten minutes: a drop is noticed
+  # within minutes, while the figure compared stays at hourly scale. Do not
+  # shrink the window to the step — a bare ten-minute bucket holds a sixth of
+  # the traffic and swings far too much week to week for a percentage threshold
+  # to mean anything.
+  #
+  # step_minutes is also the granularity requested from the API, and it is one
+  # request per step per counter: 10 minutes means 144 requests a day.
+  window_minutes: 60
+  step_minutes: 10
+
+  # How many missed windows one check works through. After downtime the service
+  # catches up gradually instead of firing a burst of stale alerts at once.
+  max_catch_up_steps: 6
 
 # --- REST API (optional) ------------------------------------------------------
 api:
