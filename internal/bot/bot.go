@@ -56,6 +56,8 @@ type Bot struct {
 	metrika   MetrikaLookup
 	admins    map[string]bool
 
+	version string
+
 	mu      sync.Mutex
 	pending map[string]*pendingAction // userID -> in-progress setup flow
 }
@@ -78,6 +80,10 @@ func New(transport Transport, db *model.DB, tasks Tasks, metrika MetrikaLookup, 
 		pending:   make(map[string]*pendingAction),
 	}
 }
+
+// SetVersion records which build is running, so /version can answer the
+// question that otherwise needs guesswork: is this deployment current?
+func (b *Bot) SetVersion(v string) { b.version = v }
 
 // IsAdmin reports whether the user may configure the service.
 //
@@ -145,6 +151,8 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		b.runReportNow(ctx, msg.ChatID, args)
 	case "poll":
 		b.runPollOnce(ctx, msg.ChatID)
+	case "version":
+		b.showVersion(ctx, msg.ChatID)
 	case "whoami":
 		b.reply(ctx, msg.ChatID, fmt.Sprintf("Твой ID: `%s`\nЧат: `%s`\nПлатформа: %s", msg.UserID, msg.ChatID, b.transport.Name()))
 	default:

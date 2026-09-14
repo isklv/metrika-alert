@@ -29,6 +29,7 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /report [counter_id] — запустить отчёт сейчас
 /poll — опросить все счётчики один раз
 /whoami — показать свой ID
+/version — версия запущенной сборки
 /help — это меню`)
 }
 
@@ -69,6 +70,16 @@ func (b *Bot) deleteCounter(ctx context.Context, chatID, args string) {
 		return
 	}
 	b.reply(ctx, chatID, fmt.Sprintf("✅ Счётчик *%s* удалён вместе с его правилами и историей", c.Name))
+}
+
+// showVersion reports the running build. A deployment that silently kept an old
+// image looks exactly like a feature that was never added; this tells them apart.
+func (b *Bot) showVersion(ctx context.Context, chatID string) {
+	v := b.version
+	if v == "" {
+		v = "неизвестна"
+	}
+	b.reply(ctx, chatID, "*Сборка:* `"+v+"`\n\nЕсли команды из документации нет в /help — запущен старый бинарь.")
 }
 
 // ---- Goals ----

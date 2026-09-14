@@ -483,3 +483,63 @@ func TestListGoalsNeedsAKnownCounter(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// The question that needed guessing twice: which build is actually running.
+func TestVersionCommand(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.SetVersion("43759de от 14.09.2026 21:42")
+
+	say(t, b, "/version")
+
+	got := tr.last()
+	if !strings.Contains(got, "43759de") {
+		t.Errorf("reply does not name the build:\n%s", got)
+	}
+	// The reply should point at the usual cause of a missing command.
+	if !strings.Contains(got, "старый бинарь") {
+		t.Errorf("reply does not explain a stale deployment:\n%s", got)
+	}
+}
+
+func TestVersionCommandWithoutStamp(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+
+	say(t, b, "/version")
+
+	if got := tr.last(); !strings.Contains(got, "неизвестна") {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Every command the menu advertises must actually be dispatched — the menu is
+// how people discover them, and a gap here is exactly what looks like a bug.
+func TestMenuCommandsAreAllDispatched(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.metrika = &fakeMetrika{}
+
+	say(t, b, "/help")
+	menu := tr.last()
+
+	checked := 0
+	for _, line := range strings.Split(menu, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "/") {
+			continue
+		}
+		command := strings.TrimPrefix(strings.Fields(line)[0], "/")
+
+		say(t, b, "/"+command+" 1")
+		if got := tr.last(); strings.Contains(got, "Неизвестная команда") {
+			t.Errorf("/%s is offered in the menu but not dispatched", command)
+		}
+		checked++
+	}
+
+	// Guard against the test passing because it parsed nothing.
+	if checked < 10 {
+		t.Fatalf("only %d menu commands were checked; the menu was not parsed", checked)
+	}
+	if !strings.Contains(menu, "/goals") {
+		t.Error("/goals is missing from the menu")
+	}
+}

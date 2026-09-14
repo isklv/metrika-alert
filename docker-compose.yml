@@ -1,8 +1,14 @@
 services:
   metrika-alert:
-    image: ghcr.io/isklv/metrika-alert:latest
-    # Build locally instead of pulling: docker compose up -d --build
-    build: .
+    # Built from this checkout, never pulled. The previous setup named a
+    # registry image as well, and compose then reused whatever was already
+    # tagged locally — so `up -d` after a `git pull` silently kept the old code.
+    build:
+      context: .
+      args:
+        # Stamp the running build so /version and the startup log can name it.
+        VERSION: "${METRIKA_VERSION:-compose}"
+    pull_policy: build
     container_name: metrika-alert
     restart: unless-stopped
 
