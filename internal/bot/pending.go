@@ -163,10 +163,74 @@ func (b *Bot) promptAddTrigger(ctx context.Context, msg Message, args string) {
 `+"`недель`"+` — сколько недель истории брать (по умолчанию 4).`)
 }
 
+// splitPipeFields splits a command string on pipe characters '|', while
+// preserving pipes that occur inside parentheses or brackets (common in regex)
+// or that are escaped with a backslash.
+func splitPipeFields(text string) []string {
+	var fields []string
+	var cur strings.Builder
+	parenDepth := 0
+	bracketDepth := 0
+	escaped := false
+
+	for _, r := range text {
+		if escaped {
+			cur.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			cur.WriteRune(r)
+			continue
+		}
+
+		switch r {
+		case '(':
+			parenDepth++
+			cur.WriteRune(r)
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			cur.WriteRune(r)
+		case '[':
+			bracketDepth++
+			cur.WriteRune(r)
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+			cur.WriteRune(r)
+		case '|':
+			if parenDepth > 0 || bracketDepth > 0 {
+				cur.WriteRune(r)
+			} else {
+				fields = append(fields, strings.TrimSpace(cur.String()))
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	fields = append(fields, strings.TrimSpace(cur.String()))
+	return fields
+}
+
+func isKnownReportKeyword(field string) bool {
+	prefixes := []string{"goals=", "group=", "group_by=", "by=", "url=", "url~"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(field, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // saveTrigger parses the pipe-delimited rule. The separator matters because the
 // name may contain spaces and "goal:42" may not be split on anything else.
 func (b *Bot) saveTrigger(ctx context.Context, p *pendingAction, text string) bool {
-	fields := strings.Split(text, "|")
+	fields := splitPipeFields(text)
 	if len(fields) < 4 || len(fields) > 7 {
 		b.reply(ctx, p.chatID, "Неверный формат. Нужно от четырёх до семи частей через `|`:\n`имя | метрика | направление | порог% [мин_база] [недель] [url=...]`")
 		return false
@@ -261,6 +325,10 @@ func takeURLScope(optional []string) (filter, match string, rest []string, err e
 	for _, field := range optional {
 		value, isRegexp, ok := parseURLScope(field)
 		if !ok {
+			if filter != "" && match == engine.URLMatchRegexp && !isKnownReportKeyword(field) {
+				filter += "|" + field
+				continue
+			}
 			rest = append(rest, field)
 			continue
 		}
@@ -333,7 +401,7 @@ ID целей: /goals `+strconv.FormatInt(counterID, 10)+`
 }
 
 func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) bool {
-	fields := strings.Split(text, "|")
+	fields := splitPipeFields(text)
 	for i := range fields {
 		fields[i] = strings.TrimSpace(fields[i])
 	}

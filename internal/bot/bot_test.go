@@ -344,6 +344,17 @@ func TestAddTriggerWithRegexpScope(t *testing.T) {
 	if triggers[0].URLFilter != `^/catalog/\d+` {
 		t.Errorf("url_filter = %q", triggers[0].URLFilter)
 	}
+
+	say(t, b, "/addtrigger 1")
+	say(t, b, `Корзина | visits | drop | 40 | url~(/checkout|/cart)`)
+
+	triggers, _ = db.ListTriggers(context.Background(), 1)
+	if len(triggers) != 2 {
+		t.Fatalf("got %d triggers, want 2", len(triggers))
+	}
+	if triggers[1].URLFilter != `(/checkout|/cart)` {
+		t.Errorf("url_filter = %q, want (/checkout|/cart)", triggers[1].URLFilter)
+	}
 }
 
 // The scope may follow the optional numbers as well as replace them.
@@ -915,5 +926,37 @@ func TestAddReportWithGroupBy(t *testing.T) {
 	got := tr.last()
 	if !strings.Contains(got, "группировка по URL") {
 		t.Errorf("listing does not mention grouping:\n%s", got)
+	}
+}
+
+func TestAddReportWithRegexAlternation(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Конверсии | url~(/apply/business/credit/credit-dlya-business/|/apply/rko/|/apply/business/ekvayring/|/apply/credit/msb/bankovskie-garantii/) | goals=310490449 | group=url")
+
+	reports, err := db.ListReports(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1; last message:\n%s", len(reports), tr.last())
+	}
+
+	r := reports[0]
+	if r.Name != "Конверсии" {
+		t.Errorf("name = %q", r.Name)
+	}
+	wantFilter := "(/apply/business/credit/credit-dlya-business/|/apply/rko/|/apply/business/ekvayring/|/apply/credit/msb/bankovskie-garantii/)"
+	if r.URLFilter != wantFilter || r.URLMatch != "regexp" {
+		t.Errorf("filter = %q/%q, want %q/regexp", r.URLFilter, r.URLMatch, wantFilter)
+	}
+	if len(r.GoalIDs) != 1 || r.GoalIDs[0] != 310490449 {
+		t.Errorf("goal_ids = %v", r.GoalIDs)
+	}
+	if r.GroupBy != "url" {
+		t.Errorf("group_by = %q", r.GroupBy)
 	}
 }
