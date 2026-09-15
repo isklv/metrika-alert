@@ -313,17 +313,19 @@ func (b *Bot) promptAddReport(ctx context.Context, msg Message, args string) {
 	b.setPending(msg.UserID, &pendingAction{kind: actionAddReport, chatID: msg.ChatID, counterID: counterID})
 	b.reply(ctx, msg.ChatID, `Пришли описание отчёта одним сообщением:
 
-`+"`имя [| url=...] [| goals=42,77]`"+`
+`+"`имя [| url=...] [| goals=42,77] [| group=url]`"+`
 
 Примеры:
 `+"`Чекаут | url=/checkout`"+`
 `+"`Заказы | goals=42,77`"+`
 `+"`Чекаут и заказы | url=/checkout | goals=42`"+`
 `+"`Каталог | url~^/catalog/`"+`
+`+"`Топ страниц | group=url`"+`
 
 `+"`url=`"+` — URL содержит подстроку, `+"`url~`"+` — регулярное выражение.
 Считаются сессии, в которых была хотя бы одна такая страница.
 `+"`goals=`"+` — какие цели показывать; без него показываются все.
+`+"`group=url`"+` — сгруппировать по страницам входа (топ URL).
 ID целей: /goals `+strconv.FormatInt(counterID, 10)+`
 
 Как только появится хотя бы один отчёт, сводка по всему счётчику присылаться
@@ -349,21 +351,49 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 	}
 
 	var goalIDs []int64
+	var groupBy string
 	for _, field := range rest {
 		field = strings.TrimSpace(field)
 		if field == "" {
 			continue
 		}
-		value, found := strings.CutPrefix(field, "goals=")
-		if !found {
-			b.reply(ctx, p.chatID, "Не понял часть `"+field+"`. Доступны `url=`, `url~` и `goals=`.")
-			return false
+		if value, found := strings.CutPrefix(field, "goals="); found {
+			goalIDs, err = parseGoalList(value)
+			if err != nil {
+				b.reply(ctx, p.chatID, "❌ "+err.Error())
+				return false
+			}
+			continue
 		}
-		goalIDs, err = parseGoalList(value)
-		if err != nil {
-			b.reply(ctx, p.chatID, "❌ "+err.Error())
-			return false
+		if value, found := strings.CutPrefix(field, "group="); found {
+			val := strings.ToLower(strings.TrimSpace(value))
+			if val != "url" {
+				b.reply(ctx, p.chatID, "❌ Неизвестная группировка `"+val+"`. Доступно: `group=url`.")
+				return false
+			}
+			groupBy = "url"
+			continue
 		}
+		if value, found := strings.CutPrefix(field, "group_by="); found {
+			val := strings.ToLower(strings.TrimSpace(value))
+			if val != "url" {
+				b.reply(ctx, p.chatID, "❌ Неизвестная группировка `"+val+"`. Доступно: `group=url`.")
+				return false
+			}
+			groupBy = "url"
+			continue
+		}
+		if value, found := strings.CutPrefix(field, "by="); found {
+			val := strings.ToLower(strings.TrimSpace(value))
+			if val != "url" {
+				b.reply(ctx, p.chatID, "❌ Неизвестная группировка `"+val+"`. Доступно: `group=url`.")
+				return false
+			}
+			groupBy = "url"
+			continue
+		}
+		b.reply(ctx, p.chatID, "Не понял часть `"+field+"`. Доступны `url=`, `url~`, `goals=` и `group=url`.")
+		return false
 	}
 
 	report := &model.Report{
@@ -372,6 +402,7 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 		URLFilter: urlFilter,
 		URLMatch:  urlMatch,
 		GoalIDs:   goalIDs,
+		GroupBy:   groupBy,
 		Enabled:   true,
 	}
 	if err := b.db.CreateReport(ctx, report); err != nil {
@@ -379,9 +410,13 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 		return false
 	}
 
+	scope := engine.URLFilterLabel(urlFilter, urlMatch)
+	if groupBy == "url" {
+		scope += ", группировка по URL"
+	}
 	b.reply(ctx, p.chatID, fmt.Sprintf(
 		"✅ Отчёт #%d *%s* создан\nОбласть: %s\n%s\n\nРасписание — /schedule",
-		report.ID, name, engine.URLFilterLabel(urlFilter, urlMatch), describeGoals(goalIDs)))
+		report.ID, name, scope, describeGoals(goalIDs)))
 	return true
 }
 

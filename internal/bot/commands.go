@@ -179,9 +179,13 @@ func (b *Bot) listReports(ctx context.Context, chatID, args string) {
 			"Сузить до страниц и целей: /addreport " + strconv.FormatInt(id, 10))
 	} else {
 		for _, r := range reports {
+			scope := engine.URLFilterLabel(r.URLFilter, r.URLMatch)
+			if r.GroupBy == "url" {
+				scope += ", группировка по URL"
+			}
 			fmt.Fprintf(&sb, "• #%d %s *%s*\n    %s\n    %s\n",
 				r.ID, enabledMark(r.Enabled), r.Name,
-				engine.URLFilterLabel(r.URLFilter, r.URLMatch), describeGoals(r.GoalIDs))
+				scope, describeGoals(r.GoalIDs))
 		}
 	}
 	b.reply(ctx, chatID, sb.String())

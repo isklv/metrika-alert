@@ -44,10 +44,11 @@ func (f *fakeRouter) last() capturedAlert {
 // reportFake answers /stat/v1/data from a map keyed by the date1 parameter, so
 // a test can give each comparison period its own figures.
 type reportFake struct {
-	mu       sync.Mutex
-	byPeriod map[string]string
-	goals    string
-	queries  []url.Values
+	mu          sync.Mutex
+	byPeriod    map[string]string
+	byDimension map[string]string
+	goals       string
+	queries     []url.Values
 }
 
 func (f *reportFake) serve(t *testing.T) string {
@@ -60,6 +61,12 @@ func (f *reportFake) serve(t *testing.T) string {
 		if strings.HasSuffix(r.URL.Path, "/goals") {
 			fmt.Fprint(w, f.goals)
 			return
+		}
+		if dim := r.URL.Query().Get("dimensions"); dim != "" && f.byDimension != nil {
+			if body, ok := f.byDimension[dim]; ok {
+				fmt.Fprint(w, body)
+				return
+			}
 		}
 		if body, ok := f.byPeriod[r.URL.Query().Get("date1")]; ok {
 			fmt.Fprint(w, body)
@@ -496,5 +503,64 @@ func TestDisabledReportIsSkipped(t *testing.T) {
 	}
 	if strings.Contains(router.last().title, "Выключенный") {
 		t.Error("a disabled report was sent")
+	}
+}
+
+func TestReportWithURLGroupBy(t *testing.T) {
+	urlData := `{
+		"data":[
+			{"dimensions":[{"name":"https://example.com/checkout"}],"metrics":[120,15]},
+			{"dimensions":[{"name":"https://example.com/cart"}],"metrics":[80,8]}
+		],
+		"totals":[200,23],
+		"total_rows":2
+	}`
+
+	fake := &reportFake{
+		byPeriod:    map[string]string{"today": totals(100, 80, 300, 20, 3, 120, 15)},
+		byDimension: map[string]string{"ym:s:startURL": urlData},
+		goals:       `{"goals":[]}`,
+	}
+	reporter, router, counter := newReporterHarness(t, fake)
+
+	report := &model.Report{
+		CounterID: counter.ID,
+		Name:      "Топ страниц",
+		GroupBy:   "url",
+		Enabled:   true,
+	}
+	client := NewReportClient(counter, fake.serve(t))
+	if err := reporter.ReportOne(context.Background(), counter, report, client, time.Now()); err != nil {
+		t.Fatalf("ReportOne: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+
+	var foundURLQuery bool
+	for _, q := range fake.queries {
+		if q.Get("dimensions") == "ym:s:startURL" {
+			foundURLQuery = true
+			if q.Get("limit") != "10" {
+				t.Errorf("limit = %q, want 10", q.Get("limit"))
+			}
+			if !strings.Contains(q.Get("metrics"), "ym:s:visits") || !strings.Contains(q.Get("metrics"), "ym:s:sumGoalReachesAny") {
+				t.Errorf("unexpected metrics in url query: %s", q.Get("metrics"))
+			}
+		}
+	}
+	if !foundURLQuery {
+		t.Fatal("no query with ym:s:startURL dimension was sent")
+	}
+
+	card := router.last()
+	if !strings.Contains(card.message, "*Страницы входа (топ):*") {
+		t.Errorf("card missing top urls section:\n%s", card.message)
+	}
+	if !strings.Contains(card.message, "example.com/checkout") || !strings.Contains(card.message, "120 виз., 15 целей") {
+		t.Errorf("card missing checkout url line:\n%s", card.message)
+	}
+	if !strings.Contains(card.message, "example.com/cart") || !strings.Contains(card.message, "80 виз., 8 целей") {
+		t.Errorf("card missing cart url line:\n%s", card.message)
 	}
 }

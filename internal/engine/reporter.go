@@ -180,13 +180,17 @@ func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report
 
 	today := summaryFrom(current)
 	goals := r.goalBreakdown(ctx, counter, client, report, filter)
+	var urls []urlEntry
+	if report.GroupBy == "url" {
+		urls = r.urlBreakdown(ctx, counter, client, report, filter)
+	}
 
 	if err := r.saveSnapshot(ctx, counter.ID, now, today, goals); err != nil {
 		log.Printf("report %q: save snapshot: %v", report.Name, err)
 	}
 
 	title := fmt.Sprintf("📊 %s — %s", reportTitle(counter, report), now.Format("02.01 15:04"))
-	card := r.buildCard(today, past, goals, bool(current.Sampled), report)
+	card := r.buildCard(today, past, goals, urls, bool(current.Sampled), report)
 
 	return r.router.Alert(ctx, counter.ID, title, card)
 }
@@ -304,8 +308,86 @@ func (r *Reporter) saveSnapshot(ctx context.Context, counterID int64, now time.T
 	})
 }
 
+// urlEntry is one entrance URL's visits and goal reach count for the report.
+type urlEntry struct {
+	url     string
+	visits  float64
+	reaches float64
+}
+
+// maxURLsInReport bounds the top entrance URLs listed in the card.
+const maxURLsInReport = 10
+
+// urlBreakdown queries the Reporting API for entrance pages with visits and goal reaches.
+func (r *Reporter) urlBreakdown(ctx context.Context, counter *model.Counter, client *ReportClient, report *model.Report, filter string) []urlEntry {
+	metrics := []string{MetricVisits}
+	var goalIDs []int64
+	if len(report.GoalIDs) > 0 {
+		goalIDs = report.GoalIDs
+		if len(goalIDs) > 10 {
+			goalIDs = goalIDs[:10]
+		}
+		for _, id := range goalIDs {
+			metrics = append(metrics, GoalReachesMetric(id))
+		}
+	} else {
+		metrics = append(metrics, MetricGoalReaches)
+	}
+
+	res, err := client.Fetch(ctx, Query{
+		Metrics:    metrics,
+		Dimensions: []string{"ym:s:startURL"},
+		Date1:      "today",
+		Date2:      "today",
+		Filters:    filter,
+		Limit:      maxURLsInReport,
+	})
+	if err != nil {
+		log.Printf("report %q: fetch url breakdown: %v", report.Name, err)
+		return nil
+	}
+
+	entries := make([]urlEntry, 0, len(res.Data))
+	for _, row := range res.Data {
+		u := row.Dimension(0, "name")
+		if u == "" {
+			continue
+		}
+		var visits float64
+		if len(row.Metrics) > 0 {
+			visits = row.Metrics[0]
+		}
+		var reaches float64
+		if len(goalIDs) > 0 {
+			for i := 1; i < len(row.Metrics); i++ {
+				reaches += row.Metrics[i]
+			}
+		} else if len(row.Metrics) > 1 {
+			reaches = row.Metrics[1]
+		}
+		entries = append(entries, urlEntry{
+			url:     u,
+			visits:  visits,
+			reaches: reaches,
+		})
+	}
+	return entries
+}
+
+func cleanURLForDisplay(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "https://")
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.ReplaceAll(raw, "`", "")
+	runes := []rune(raw)
+	if len(runes) > 60 {
+		return string(runes[:57]) + "..."
+	}
+	return raw
+}
+
 // buildCard renders the report.
-func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goalEntry, sampled bool, report *model.Report) string {
+func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goalEntry, urls []urlEntry, sampled bool, report *model.Report) string {
 	var b strings.Builder
 
 	if scope := URLFilterLabel(report.URLFilter, report.URLMatch); report.URLFilter != "" {
@@ -334,6 +416,14 @@ func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goa
 		b.WriteString("\n*Цели:*\n")
 		for _, g := range goals {
 			b.WriteString(fmt.Sprintf("  • %s: %.0f\n", g.name, g.reaches))
+		}
+	}
+
+	if len(urls) > 0 {
+		b.WriteString("\n*Страницы входа (топ):*\n")
+		for _, u := range urls {
+			b.WriteString(fmt.Sprintf("  • `%s` — %.0f виз., %.0f целей\n",
+				cleanURLForDisplay(u.url), u.visits, u.reaches))
 		}
 	}
 

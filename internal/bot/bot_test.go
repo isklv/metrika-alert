@@ -824,6 +824,7 @@ func TestAddReportRejectsBadInput(t *testing.T) {
 		"Отчёт | goals=сорок два",   // not an ID
 		"Отчёт | url~^/a[",          // uncompilable regexp
 		"Отчёт | что-то непонятное", // unknown field
+		"Отчёт | group=bad",         // unknown grouping
 	} {
 		say(t, b, bad)
 		if got := tr.last(); !strings.ContainsAny(got, "❌") && !strings.Contains(got, "не должн") &&
@@ -877,5 +878,42 @@ func TestListAndDeleteReports(t *testing.T) {
 	say(t, b, fmt.Sprintf("/deletereport %d", reports[0].ID))
 	if remaining, _ := db.ListReports(ctx, 1); len(remaining) != 0 {
 		t.Errorf("report was not deleted: %+v", remaining)
+	}
+}
+
+func TestAddReportWithGroupBy(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Топ страниц | group=url")
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Чекаут и цели | url=/checkout | goals=42 | group_by=url")
+
+	reports, err := db.ListReports(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 2 {
+		t.Fatalf("got %d reports, want 2", len(reports))
+	}
+
+	if reports[0].GroupBy != "url" || reports[0].Name != "Топ страниц" {
+		t.Errorf("report[0] = %+v", reports[0])
+	}
+	if !reports[0].Scoped() {
+		t.Errorf("group=url report must be scoped")
+	}
+
+	if reports[1].GroupBy != "url" || reports[1].URLFilter != "/checkout" || len(reports[1].GoalIDs) != 1 {
+		t.Errorf("report[1] = %+v", reports[1])
+	}
+
+	say(t, b, "/reports 1")
+	got := tr.last()
+	if !strings.Contains(got, "группировка по URL") {
+		t.Errorf("listing does not mention grouping:\n%s", got)
 	}
 }

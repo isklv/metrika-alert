@@ -65,14 +65,16 @@ type Report struct {
 	// URLMatch is how URLFilter is compared: "contains" or "regexp".
 	URLMatch string `json:"url_match,omitempty"`
 	// GoalIDs selects which goals to break down. Empty means all of them.
-	GoalIDs   []int64   `json:"goal_ids,omitempty"`
+	GoalIDs []int64 `json:"goal_ids,omitempty"`
+	// GroupBy specifies grouping dimension, e.g. "url" for entrance URLs.
+	GroupBy   string    `json:"group_by,omitempty"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // Scoped reports whether the report covers less than the whole counter.
 func (r Report) Scoped() bool {
-	return strings.TrimSpace(r.URLFilter) != "" || len(r.GoalIDs) > 0
+	return strings.TrimSpace(r.URLFilter) != "" || len(r.GoalIDs) > 0 || strings.TrimSpace(r.GroupBy) != ""
 }
 
 // Alert is a fired notification.

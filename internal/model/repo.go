@@ -448,12 +448,12 @@ func (db *DB) SetSettingTime(ctx context.Context, key string, t time.Time) error
 
 // ---- Reports ----
 
-const reportColumns = `id, counter_id, name, url_filter, url_match, goal_ids, enabled, created_at`
+const reportColumns = `id, counter_id, name, url_filter, url_match, goal_ids, group_by, enabled, created_at`
 
 func scanReport(row interface{ Scan(...any) error }) (Report, error) {
 	var r Report
 	var goalIDs string
-	err := row.Scan(&r.ID, &r.CounterID, &r.Name, &r.URLFilter, &r.URLMatch, &goalIDs, &r.Enabled, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.CounterID, &r.Name, &r.URLFilter, &r.URLMatch, &goalIDs, &r.GroupBy, &r.Enabled, &r.CreatedAt)
 	if err != nil {
 		return r, err
 	}
@@ -487,9 +487,9 @@ func formatGoalIDs(ids []int64) string {
 
 func (db *DB) CreateReport(ctx context.Context, r *Report) error {
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO reports (counter_id, name, url_filter, url_match, goal_ids, enabled)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		r.CounterID, r.Name, r.URLFilter, r.URLMatch, formatGoalIDs(r.GoalIDs), r.Enabled,
+		`INSERT INTO reports (counter_id, name, url_filter, url_match, goal_ids, group_by, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.CounterID, r.Name, r.URLFilter, r.URLMatch, formatGoalIDs(r.GoalIDs), r.GroupBy, r.Enabled,
 	)
 	if err != nil {
 		return fmt.Errorf("create report: %w", err)

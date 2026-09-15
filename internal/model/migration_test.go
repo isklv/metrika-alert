@@ -405,3 +405,70 @@ func TestMigrationAddsURLScopeColumns(t *testing.T) {
 		t.Errorf("scoped rule did not round-trip: %+v", scoped)
 	}
 }
+
+func TestMigrationAddsGroupByToReports(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre_groupby.db")
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE counters (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+			counter_id TEXT UNIQUE NOT NULL, oauth_token TEXT NOT NULL,
+			poll_interval_minutes INTEGER NOT NULL DEFAULT 60,
+			last_hour_checked DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+		CREATE TABLE reports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			counter_id INTEGER NOT NULL REFERENCES counters(id),
+			name TEXT NOT NULL,
+			url_filter TEXT NOT NULL DEFAULT '',
+			url_match TEXT NOT NULL DEFAULT '',
+			goal_ids TEXT NOT NULL DEFAULT '',
+			enabled BOOLEAN NOT NULL DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+		INSERT INTO counters (id, name, counter_id, oauth_token) VALUES (1, 'Магазин', '12345678', 'y0_tok');
+		INSERT INTO reports (counter_id, name, url_filter, url_match, goal_ids, enabled)
+		VALUES (1, 'Старый отчёт', '/checkout', 'contains', '42', 1);
+	` + legacySchema); err != nil {
+		t.Fatalf("create pre-groupby schema: %v", err)
+	}
+	raw.Close()
+
+	db, err := OpenDB(path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	reports, err := db.ListReports(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1", len(reports))
+	}
+	if reports[0].GroupBy != "" {
+		t.Errorf("old report has group_by: %q", reports[0].GroupBy)
+	}
+
+	newReport := &Report{
+		CounterID: 1,
+		Name:      "Топ URL",
+		GroupBy:   "url",
+		Enabled:   true,
+	}
+	if err := db.CreateReport(ctx, newReport); err != nil {
+		t.Fatalf("CreateReport: %v", err)
+	}
+
+	reports, err = db.ListReports(ctx, 1)
+	if err != nil || len(reports) != 2 {
+		t.Fatalf("ListReports: got %d reports, err: %v", len(reports), err)
+	}
+	if reports[1].GroupBy != "url" {
+		t.Errorf("GroupBy = %q, want 'url'", reports[1].GroupBy)
+	}
+}
