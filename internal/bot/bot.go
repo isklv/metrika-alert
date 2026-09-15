@@ -13,6 +13,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/isklv/metrika-alert/internal/engine"
 	"github.com/isklv/metrika-alert/internal/model"
@@ -48,6 +49,13 @@ type MetrikaLookup interface {
 	Goals(ctx context.Context, counter *model.Counter) ([]engine.Goal, error)
 }
 
+// ReportScheduler reads and changes when periodic reports are sent.
+type ReportScheduler interface {
+	Schedule(ctx context.Context) engine.Schedule
+	SetSchedule(ctx context.Context, s engine.Schedule) error
+	NextRun(ctx context.Context) (time.Time, bool)
+}
+
 // Tasks runs the background jobs the bot can trigger on demand.
 type Tasks interface {
 	// RunReport builds and delivers a report; counterID 0 means every counter.
@@ -64,7 +72,8 @@ type Bot struct {
 	metrika   MetrikaLookup
 	admins    map[string]bool
 
-	version string
+	version   string
+	scheduler ReportScheduler
 
 	mu      sync.Mutex
 	pending map[string]*pendingAction // userID -> in-progress setup flow
@@ -88,6 +97,9 @@ func New(transport Transport, db *model.DB, tasks Tasks, metrika MetrikaLookup, 
 		pending:   make(map[string]*pendingAction),
 	}
 }
+
+// SetScheduler wires the report schedule so it can be changed from a chat.
+func (b *Bot) SetScheduler(s ReportScheduler) { b.scheduler = s }
 
 // SetVersion records which build is running, so /version can answer the
 // question that otherwise needs guesswork: is this deployment current?
@@ -157,6 +169,14 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		b.listAlerts(ctx, msg.ChatID, args)
 	case "report":
 		b.runReportNow(ctx, msg.ChatID, args)
+	case "schedule":
+		b.reportSchedule(ctx, msg.ChatID, args)
+	case "reports":
+		b.listReports(ctx, msg.ChatID, args)
+	case "addreport":
+		b.promptAddReport(ctx, msg, args)
+	case "deletereport":
+		b.deleteReport(ctx, msg.ChatID, args)
 	case "poll":
 		b.runPollOnce(ctx, msg.ChatID)
 	case "version":

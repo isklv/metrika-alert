@@ -24,6 +24,7 @@ const (
 	actionAddCounter = "addcounter"
 	actionAddTrigger = "addtrigger"
 	actionAddAction  = "addaction"
+	actionAddReport  = "addreport"
 )
 
 type pendingAction struct {
@@ -62,6 +63,8 @@ func (b *Bot) handlePending(ctx context.Context, userID, text string) bool {
 		done = b.saveTrigger(ctx, p, text)
 	case actionAddAction:
 		done = b.saveAlertAction(ctx, p, text)
+	case actionAddReport:
+		done = b.saveReport(ctx, p, text)
 	default:
 		b.clearPending(userID)
 		return false
@@ -293,6 +296,113 @@ func parseURLScope(field string) (value string, isRegexp, ok bool) {
 		return strings.TrimSpace(v), false, true
 	}
 	return "", false, false
+}
+
+// ---- add report ----
+
+func (b *Bot) promptAddReport(ctx context.Context, msg Message, args string) {
+	counterID, ok := b.parseID(ctx, msg.ChatID, args, "/addreport 1")
+	if !ok {
+		return
+	}
+	if _, err := b.db.GetCounter(ctx, counterID); err != nil {
+		b.reply(ctx, msg.ChatID, "❌ Счётчик не найден. Список: /counters")
+		return
+	}
+
+	b.setPending(msg.UserID, &pendingAction{kind: actionAddReport, chatID: msg.ChatID, counterID: counterID})
+	b.reply(ctx, msg.ChatID, `Пришли описание отчёта одним сообщением:
+
+`+"`имя [| url=...] [| goals=42,77]`"+`
+
+Примеры:
+`+"`Чекаут | url=/checkout`"+`
+`+"`Заказы | goals=42,77`"+`
+`+"`Чекаут и заказы | url=/checkout | goals=42`"+`
+`+"`Каталог | url~^/catalog/`"+`
+
+`+"`url=`"+` — URL содержит подстроку, `+"`url~`"+` — регулярное выражение.
+Считаются сессии, в которых была хотя бы одна такая страница.
+`+"`goals=`"+` — какие цели показывать; без него показываются все.
+ID целей: /goals `+strconv.FormatInt(counterID, 10)+`
+
+Как только появится хотя бы один отчёт, сводка по всему счётчику присылаться
+перестанет — заведите её отдельным отчётом без фильтров, если она нужна.`)
+}
+
+func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) bool {
+	fields := strings.Split(text, "|")
+	for i := range fields {
+		fields[i] = strings.TrimSpace(fields[i])
+	}
+
+	name := fields[0]
+	if name == "" {
+		b.reply(ctx, p.chatID, "Имя отчёта не должно быть пустым.")
+		return false
+	}
+
+	urlFilter, urlMatch, rest, err := takeURLScope(fields[1:])
+	if err != nil {
+		b.reply(ctx, p.chatID, "❌ "+err.Error())
+		return false
+	}
+
+	var goalIDs []int64
+	for _, field := range rest {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		value, found := strings.CutPrefix(field, "goals=")
+		if !found {
+			b.reply(ctx, p.chatID, "Не понял часть `"+field+"`. Доступны `url=`, `url~` и `goals=`.")
+			return false
+		}
+		goalIDs, err = parseGoalList(value)
+		if err != nil {
+			b.reply(ctx, p.chatID, "❌ "+err.Error())
+			return false
+		}
+	}
+
+	report := &model.Report{
+		CounterID: p.counterID,
+		Name:      name,
+		URLFilter: urlFilter,
+		URLMatch:  urlMatch,
+		GoalIDs:   goalIDs,
+		Enabled:   true,
+	}
+	if err := b.db.CreateReport(ctx, report); err != nil {
+		b.replyErr(ctx, p.chatID, err)
+		return false
+	}
+
+	b.reply(ctx, p.chatID, fmt.Sprintf(
+		"✅ Отчёт #%d *%s* создан\nОбласть: %s\n%s\n\nРасписание — /schedule",
+		report.ID, name, engine.URLFilterLabel(urlFilter, urlMatch), describeGoals(goalIDs)))
+	return true
+}
+
+// parseGoalList reads "42,77" into goal IDs.
+func parseGoalList(s string) ([]int64, error) {
+	var ids []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "goal:"))
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("«%s» не похоже на ID цели — нужны числа через запятую, например `goals=42,77`", part)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("после `goals=` нужен хотя бы один ID цели")
+	}
+	return ids, nil
 }
 
 // ---- add alert action ----

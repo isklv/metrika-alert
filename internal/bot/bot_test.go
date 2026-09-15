@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/isklv/metrika-alert/internal/engine"
 	"github.com/isklv/metrika-alert/internal/model"
@@ -624,5 +625,257 @@ func TestLongReplyArrivesInParts(t *testing.T) {
 		if !strings.Contains(all, fmt.Sprintf("goal:%d", id)) {
 			t.Errorf("goal:%d was lost", id)
 		}
+	}
+}
+
+// ---- Report schedule ----
+
+// fakeScheduler stands in for the report schedule.
+type fakeScheduler struct {
+	schedule engine.Schedule
+	next     time.Time
+	setErr   error
+}
+
+func (f *fakeScheduler) Schedule(context.Context) engine.Schedule { return f.schedule }
+
+func (f *fakeScheduler) SetSchedule(_ context.Context, s engine.Schedule) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
+	f.schedule = s
+	return nil
+}
+
+func (f *fakeScheduler) NextRun(context.Context) (time.Time, bool) {
+	if f.schedule.Off() {
+		return time.Time{}, false
+	}
+	return f.next, true
+}
+
+// The request that prompted this: hourly reports are too many, make it daily,
+// from the chat rather than a config file.
+func TestScheduleCommandSetsDailySchedule(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	sched := &fakeScheduler{
+		schedule: engine.Schedule{Kind: engine.ScheduleEvery, Every: time.Hour},
+		next:     time.Now().Add(3 * time.Hour),
+	}
+	b.SetScheduler(sched)
+
+	say(t, b, "/schedule 10:00")
+
+	if sched.schedule.Kind != engine.ScheduleDaily || sched.schedule.Hour != 10 {
+		t.Fatalf("schedule = %+v, want daily at 10:00", sched.schedule)
+	}
+	got := tr.last()
+	if !strings.Contains(got, "каждый день в 10:00") {
+		t.Errorf("reply does not confirm the new schedule:\n%s", got)
+	}
+	// Changing it must not require a restart, and the reply should say so.
+	if !strings.Contains(got, "перезапуск не нужен") {
+		t.Errorf("reply does not say it takes effect on its own:\n%s", got)
+	}
+}
+
+func TestScheduleCommandShowsCurrentSchedule(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	b.SetScheduler(&fakeScheduler{
+		schedule: engine.Schedule{Kind: engine.ScheduleDaily, Hour: 9, Minute: 30},
+		next:     time.Now().Add(90 * time.Minute),
+	})
+
+	say(t, b, "/schedule")
+
+	got := tr.last()
+	if !strings.Contains(got, "каждый день в 09:30") {
+		t.Errorf("reply does not show the schedule:\n%s", got)
+	}
+	// Knowing when the next one lands is half the reason to ask.
+	if !strings.Contains(got, "Ближайший") {
+		t.Errorf("reply does not say when the next report lands:\n%s", got)
+	}
+	if !strings.Contains(got, "/schedule 10:00") {
+		t.Errorf("reply does not show how to change it:\n%s", got)
+	}
+}
+
+func TestScheduleCommandAcceptsIntervalAndOff(t *testing.T) {
+	b, _, _ := newTestBot(t, admin)
+	sched := &fakeScheduler{next: time.Now().Add(time.Hour)}
+	b.SetScheduler(sched)
+
+	say(t, b, "/schedule 6h")
+	if sched.schedule.Kind != engine.ScheduleEvery || sched.schedule.Every != 6*time.Hour {
+		t.Errorf("schedule = %+v, want every 6h", sched.schedule)
+	}
+
+	say(t, b, "/schedule off")
+	if !sched.schedule.Off() {
+		t.Errorf("schedule = %+v, want off", sched.schedule)
+	}
+}
+
+func TestScheduleCommandRejectsNonsense(t *testing.T) {
+	b, tr, _ := newTestBot(t, admin)
+	sched := &fakeScheduler{schedule: engine.Schedule{Kind: engine.ScheduleDaily, Hour: 10}}
+	b.SetScheduler(sched)
+
+	for _, bad := range []string{"25:00", "по вторникам", "5m"} {
+		say(t, b, "/schedule "+bad)
+		if got := tr.last(); !strings.Contains(got, "❌") {
+			t.Errorf("input %q was accepted: %s", bad, got)
+		}
+	}
+	// The existing schedule must survive a rejected change.
+	if sched.schedule.Hour != 10 {
+		t.Errorf("a rejected input changed the schedule to %+v", sched.schedule)
+	}
+}
+
+// ---- Report definitions ----
+
+func seedCounter(t *testing.T, b *Bot) {
+	t.Helper()
+	say(t, b, "/addcounter")
+	say(t, b, "Магазин 12345678 y0_token")
+}
+
+func TestAddReportWithPageAndGoals(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	seedCounter(t, b)
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Чекаут и заказы | url=/checkout | goals=42,77")
+
+	reports, err := db.ListReports(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1", len(reports))
+	}
+
+	got := reports[0]
+	if got.Name != "Чекаут и заказы" {
+		t.Errorf("name = %q", got.Name)
+	}
+	if got.URLFilter != "/checkout" || got.URLMatch != "contains" {
+		t.Errorf("scope = %q/%q", got.URLFilter, got.URLMatch)
+	}
+	if len(got.GoalIDs) != 2 || got.GoalIDs[0] != 42 || got.GoalIDs[1] != 77 {
+		t.Errorf("goal_ids = %v", got.GoalIDs)
+	}
+}
+
+func TestAddReportAcceptsEitherScopeAlone(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Только страница | url=/cart")
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Только цели | goals=42")
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Весь счётчик")
+
+	reports, _ := db.ListReports(ctx, 1)
+	if len(reports) != 3 {
+		t.Fatalf("got %d reports, want 3", len(reports))
+	}
+	if reports[0].URLFilter != "/cart" || len(reports[0].GoalIDs) != 0 {
+		t.Errorf("page-only report = %+v", reports[0])
+	}
+	if reports[1].URLFilter != "" || len(reports[1].GoalIDs) != 1 {
+		t.Errorf("goal-only report = %+v", reports[1])
+	}
+	// A report with neither is the whole counter, which is a legitimate choice
+	// once other reports exist and the implicit one has stopped.
+	if reports[2].Scoped() {
+		t.Errorf("unscoped report reads as scoped: %+v", reports[2])
+	}
+}
+
+func TestAddReportAcceptsRegexpScope(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	seedCounter(t, b)
+
+	say(t, b, "/addreport 1")
+	say(t, b, `Каталог | url~^/catalog/\d+`)
+
+	reports, _ := db.ListReports(context.Background(), 1)
+	if len(reports) != 1 || reports[0].URLMatch != "regexp" {
+		t.Fatalf("reports = %+v", reports)
+	}
+}
+
+func TestAddReportRejectsBadInput(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	say(t, b, "/addreport 1")
+
+	for _, bad := range []string{
+		"| url=/checkout",           // no name
+		"Отчёт | goals=",            // empty goal list
+		"Отчёт | goals=сорок два",   // not an ID
+		"Отчёт | url~^/a[",          // uncompilable regexp
+		"Отчёт | что-то непонятное", // unknown field
+	} {
+		say(t, b, bad)
+		if got := tr.last(); !strings.ContainsAny(got, "❌") && !strings.Contains(got, "не должн") &&
+			!strings.Contains(got, "Не понял") {
+			t.Errorf("input %q was accepted: %s", bad, got)
+		}
+	}
+
+	if reports, _ := db.ListReports(context.Background(), 1); len(reports) != 0 {
+		t.Fatalf("malformed input created %d report(s)", len(reports))
+	}
+}
+
+// goals= accepts the same goal:N spelling the /goals listing prints, so a value
+// can be pasted straight across.
+func TestAddReportAcceptsGoalPrefixedIDs(t *testing.T) {
+	b, _, db := newTestBot(t, admin)
+	seedCounter(t, b)
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Заказы | goals=goal:42, goal:77")
+
+	reports, _ := db.ListReports(context.Background(), 1)
+	if len(reports) != 1 || len(reports[0].GoalIDs) != 2 {
+		t.Fatalf("reports = %+v", reports)
+	}
+}
+
+func TestListAndDeleteReports(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/reports 1")
+	if got := tr.last(); !strings.Contains(got, "сводка по всему счётчику") {
+		t.Errorf("an unconfigured counter should say what it currently sends:\n%s", got)
+	}
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Чекаут | url=/checkout | goals=42")
+
+	say(t, b, "/reports 1")
+	got := tr.last()
+	for _, want := range []string{"Чекаут", "/checkout", "goal:42"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("listing is missing %q:\n%s", want, got)
+		}
+	}
+
+	reports, _ := db.ListReports(ctx, 1)
+	say(t, b, fmt.Sprintf("/deletereport %d", reports[0].ID))
+	if remaining, _ := db.ListReports(ctx, 1); len(remaining) != 0 {
+		t.Errorf("report was not deleted: %+v", remaining)
 	}
 }

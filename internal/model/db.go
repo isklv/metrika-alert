@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS counters (
 
 
 
+-- Settings the bot can change at runtime. Keeping them here rather than in
+-- config.yaml is what lets a schedule be retuned from a chat without editing a
+-- file and restarting the service.
+CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS alert_actions (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT NOT NULL,
@@ -56,6 +65,20 @@ CREATE TABLE IF NOT EXISTS alert_actions (
 	chat_id INTEGER,
 	target TEXT NOT NULL DEFAULT '',
 	url TEXT,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A report definition: what a periodic report covers. Without any, the service
+-- reports each counter as a whole, which is what it always did.
+CREATE TABLE IF NOT EXISTS reports (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	counter_id INTEGER NOT NULL REFERENCES counters(id),
+	name TEXT NOT NULL,
+	url_filter TEXT NOT NULL DEFAULT '',
+	url_match TEXT NOT NULL DEFAULT '',
+	-- Comma-separated goal IDs; empty means every goal of the counter.
+	goal_ids TEXT NOT NULL DEFAULT '',
+	enabled BOOLEAN NOT NULL DEFAULT 1,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -87,6 +110,7 @@ CREATE TABLE IF NOT EXISTS report_snapshots (
 
 
 CREATE INDEX IF NOT EXISTS idx_alerts_counter ON alerts(counter_id);
+CREATE INDEX IF NOT EXISTS idx_reports_counter ON reports(counter_id);
 CREATE INDEX IF NOT EXISTS idx_snapshots_counter_period ON report_snapshots(counter_id, period, period_key);
 `
 

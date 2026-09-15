@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"time"
+
 	"github.com/isklv/metrika-alert/internal/engine"
 )
 
@@ -26,7 +28,11 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /deleteaction <id> — удалить destination
 
 /alerts [counter_id] — история алертов
-/report [counter_id] — запустить отчёт сейчас
+/reports <counter_id> — какие отчёты настроены
+/addreport <counter_id> — отчёт по страницам и целям
+/deletereport <id> — удалить отчёт
+/report [counter_id] — запустить отчёты сейчас
+/schedule [расписание] — когда присылать отчёты
 /poll — опросить все счётчики один раз
 /whoami — показать свой ID
 /version — версия запущенной сборки
@@ -80,6 +86,129 @@ func (b *Bot) showVersion(ctx context.Context, chatID string) {
 		v = "неизвестна"
 	}
 	b.reply(ctx, chatID, "*Сборка:* `"+v+"`\n\nЕсли команды из документации нет в /help — запущен старый бинарь.")
+}
+
+// reportSchedule shows or changes when periodic reports are sent.
+func (b *Bot) reportSchedule(ctx context.Context, chatID, args string) {
+	if b.scheduler == nil {
+		b.reply(ctx, chatID, "❌ Расписание недоступно: движок не подключён.")
+		return
+	}
+
+	args = strings.TrimSpace(args)
+	if args == "" {
+		b.showReportSchedule(ctx, chatID)
+		return
+	}
+
+	schedule, err := engine.ParseSchedule(args)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ "+err.Error()+"\n\n"+reportScheduleHelp)
+		return
+	}
+	if err := b.scheduler.SetSchedule(ctx, schedule); err != nil {
+		b.replyErr(ctx, chatID, err)
+		return
+	}
+
+	reply := "✅ Отчёты: *" + schedule.Describe() + "*"
+	if next, ok := b.scheduler.NextRun(ctx); ok {
+		reply += "\nБлижайший — " + formatNextRun(next)
+	}
+	reply += "\n\nПрименится в течение минуты, перезапуск не нужен."
+	b.reply(ctx, chatID, reply)
+}
+
+func (b *Bot) showReportSchedule(ctx context.Context, chatID string) {
+	schedule := b.scheduler.Schedule(ctx)
+
+	reply := "*Отчёты:* " + schedule.Describe()
+	if next, ok := b.scheduler.NextRun(ctx); ok {
+		reply += "\nБлижайший — " + formatNextRun(next)
+	}
+	b.reply(ctx, chatID, reply+"\n\n"+reportScheduleHelp)
+}
+
+const reportScheduleHelp = "Изменить:\n" +
+	"`/schedule 10:00` — каждый день в 10:00\n" +
+	"`/schedule 6h` — каждые 6 часов\n" +
+	"`/schedule off` — не присылать\n\n" +
+	"Время — в часовом поясе сервиса."
+
+// formatNextRun renders when the next report lands, with how long that is away.
+func formatNextRun(next time.Time) string {
+	wait := time.Until(next).Round(time.Minute)
+	if wait < 0 {
+		return "сейчас"
+	}
+	return fmt.Sprintf("%s (через %s)", next.Format("02.01 15:04"), formatWait(wait))
+}
+
+func formatWait(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	if hours == 0 {
+		return fmt.Sprintf("%d мин", minutes)
+	}
+	return fmt.Sprintf("%d ч %d мин", hours, minutes)
+}
+
+// ---- Reports ----
+
+func (b *Bot) listReports(ctx context.Context, chatID, args string) {
+	id, ok := b.parseID(ctx, chatID, args, "/reports 1")
+	if !ok {
+		return
+	}
+	counter, err := b.db.GetCounter(ctx, id)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ Счётчик не найден. Список: /counters")
+		return
+	}
+
+	reports, err := b.db.ListReports(ctx, id)
+	if err != nil {
+		b.replyErr(ctx, chatID, err)
+		return
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "*Отчёты — %s:*\n\n", counter.Name)
+	if len(reports) == 0 {
+		sb.WriteString("_Отдельных отчётов нет — присылается сводка по всему счётчику._\n\n" +
+			"Сузить до страниц и целей: /addreport " + strconv.FormatInt(id, 10))
+	} else {
+		for _, r := range reports {
+			fmt.Fprintf(&sb, "• #%d %s *%s*\n    %s\n    %s\n",
+				r.ID, enabledMark(r.Enabled), r.Name,
+				engine.URLFilterLabel(r.URLFilter, r.URLMatch), describeGoals(r.GoalIDs))
+		}
+	}
+	b.reply(ctx, chatID, sb.String())
+}
+
+// describeGoals renders which goals a report covers.
+func describeGoals(ids []int64) string {
+	if len(ids) == 0 {
+		return "все цели"
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, "goal:"+strconv.FormatInt(id, 10))
+	}
+	return "цели: " + strings.Join(parts, ", ")
+}
+
+func (b *Bot) deleteReport(ctx context.Context, chatID, args string) {
+	id, ok := b.parseID(ctx, chatID, args, "/deletereport 1")
+	if !ok {
+		return
+	}
+	if err := b.db.DeleteReport(ctx, id); err != nil {
+		b.replyErr(ctx, chatID, err)
+		return
+	}
+	b.reply(ctx, chatID, "✅ Отчёт удалён")
 }
 
 // ---- Goals ----

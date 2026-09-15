@@ -113,13 +113,14 @@ func main() {
 	var wg sync.WaitGroup
 	tasks := &engineTasks{poller: poller, reporter: reporter}
 
+	// config.yaml only supplies the starting point; once a schedule is set
+	// from a chat it lives in the database and survives restarts.
+	fallback := engine.Schedule{Kind: engine.ScheduleOff}
 	if cfg.ReportHour > 0 {
-		wg.Go(func() {
-			runReportsLoop(ctx, reporter, time.Duration(cfg.ReportHour)*time.Hour)
-		})
-	} else {
-		log.Printf("periodic reports disabled (report_interval_hours = 0)")
+		fallback = engine.Schedule{Kind: engine.ScheduleEvery, Every: time.Duration(cfg.ReportHour) * time.Hour}
 	}
+	scheduler := engine.NewReportScheduler(db, reporter, fallback)
+	wg.Go(func() { scheduler.Run(ctx) })
 
 	// --- Bots ---------------------------------------------------------------
 	if tgBot != nil {
@@ -131,6 +132,7 @@ func main() {
 
 		b := bot.New(bot.NewTelegramTransport(tgBot), db, tasks, lookup, admins)
 		b.SetVersion(buildVersion())
+		b.SetScheduler(scheduler)
 		wg.Go(func() { bot.RunTelegram(ctx, tgBot, b) })
 	}
 
@@ -139,6 +141,7 @@ func main() {
 
 		b := bot.New(bot.NewVKTeamsTransport(vkClient), db, tasks, lookup, cfg.VKTeams.AdminIDs)
 		b.SetVersion(buildVersion())
+		b.SetScheduler(scheduler)
 		wg.Go(func() { bot.RunVKTeams(ctx, vkClient, b) })
 	}
 
@@ -291,23 +294,6 @@ func warnIfNoAdmins(platform string, count int) {
 	if count == 0 {
 		log.Printf("WARNING: %s.admin_ids is empty — the bot will refuse every command. "+
 			"Message it and it will reply with the ID to add.", platform)
-	}
-}
-
-func runReportsLoop(ctx context.Context, reporter *engine.Reporter, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	log.Printf("periodic reports every %s", interval)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := reporter.RunReports(ctx); err != nil {
-				log.Printf("report run: %v", err)
-			}
-		}
 	}
 }
 

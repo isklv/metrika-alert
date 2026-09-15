@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -87,6 +89,7 @@ func (db *DB) DeleteCounter(ctx context.Context, id int64) error {
 	defer tx.Rollback()
 
 	stmts := []string{
+		`DELETE FROM reports WHERE counter_id = ?`,
 		`DELETE FROM trigger_cooldowns WHERE trigger_id IN (SELECT id FROM triggers WHERE counter_id = ?)`,
 		`DELETE FROM triggers WHERE counter_id = ?`,
 		`DELETE FROM report_snapshots WHERE counter_id = ?`,
@@ -380,6 +383,158 @@ func (db *DB) SetLastHourChecked(ctx context.Context, counterID int64, hour time
 	_, err := db.ExecContext(ctx, `UPDATE counters SET last_hour_checked = ? WHERE id = ?`, hour, counterID)
 	if err != nil {
 		return fmt.Errorf("set last checked hour: %w", err)
+	}
+	return nil
+}
+
+// ---- Settings ----
+//
+// Runtime settings live in the database so the bot can change them without a
+// config edit and a restart, and so they survive one.
+
+// Setting keys.
+const (
+	// SettingReportSchedule is when periodic reports are sent.
+	SettingReportSchedule = "report_schedule"
+	// SettingReportLastRun is when the last periodic report went out, so a
+	// restart neither repeats one nor skips one.
+	SettingReportLastRun = "report_last_run"
+)
+
+// Setting returns a stored value, or ok=false when it was never set.
+func (db *DB) Setting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get setting %s: %w", key, err)
+	}
+	return value, true, nil
+}
+
+// SetSetting stores a value.
+func (db *DB) SetSetting(ctx context.Context, key, value string) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+		key, value)
+	if err != nil {
+		return fmt.Errorf("set setting %s: %w", key, err)
+	}
+	return nil
+}
+
+// SettingTime reads a stored timestamp, or the zero time when unset.
+func (db *DB) SettingTime(ctx context.Context, key string) (time.Time, error) {
+	raw, ok, err := db.Setting(ctx, key)
+	if err != nil || !ok {
+		return time.Time{}, err
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		// A corrupted timestamp must not wedge the schedule forever; treating
+		// it as "never ran" makes the next tick recover.
+		return time.Time{}, nil
+	}
+	return t, nil
+}
+
+// SetSettingTime stores a timestamp.
+func (db *DB) SetSettingTime(ctx context.Context, key string, t time.Time) error {
+	return db.SetSetting(ctx, key, t.Format(time.RFC3339))
+}
+
+// ---- Reports ----
+
+const reportColumns = `id, counter_id, name, url_filter, url_match, goal_ids, enabled, created_at`
+
+func scanReport(row interface{ Scan(...any) error }) (Report, error) {
+	var r Report
+	var goalIDs string
+	err := row.Scan(&r.ID, &r.CounterID, &r.Name, &r.URLFilter, &r.URLMatch, &goalIDs, &r.Enabled, &r.CreatedAt)
+	if err != nil {
+		return r, err
+	}
+	r.GoalIDs = parseGoalIDs(goalIDs)
+	return r, nil
+}
+
+// parseGoalIDs reads the stored comma-separated list, skipping anything
+// unreadable rather than failing the whole row.
+func parseGoalIDs(s string) []int64 {
+	var out []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if id, err := strconv.ParseInt(part, 10, 64); err == nil && id > 0 {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func formatGoalIDs(ids []int64) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (db *DB) CreateReport(ctx context.Context, r *Report) error {
+	res, err := db.ExecContext(ctx,
+		`INSERT INTO reports (counter_id, name, url_filter, url_match, goal_ids, enabled)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		r.CounterID, r.Name, r.URLFilter, r.URLMatch, formatGoalIDs(r.GoalIDs), r.Enabled,
+	)
+	if err != nil {
+		return fmt.Errorf("create report: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	r.ID = id
+	r.CreatedAt = time.Now()
+	return nil
+}
+
+// ListReports returns the reports for one counter, or for every counter when
+// counterID is zero.
+func (db *DB) ListReports(ctx context.Context, counterID int64) ([]Report, error) {
+	query := `SELECT ` + reportColumns + ` FROM reports`
+	var args []any
+	if counterID > 0 {
+		query += ` WHERE counter_id = ?`
+		args = append(args, counterID)
+	}
+	query += ` ORDER BY id`
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list reports: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Report
+	for rows.Next() {
+		r, err := scanReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) DeleteReport(ctx context.Context, id int64) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM reports WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete report: %w", err)
 	}
 	return nil
 }

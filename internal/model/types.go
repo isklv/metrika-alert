@@ -2,6 +2,7 @@ package model
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,29 @@ type Trigger struct {
 	Cooldown  int       `json:"cooldown_minutes"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// Report defines what one periodic report covers.
+//
+// Scoping matters because a site-wide card averages away the thing being
+// watched: checkout traffic halving is invisible next to the rest of the site.
+type Report struct {
+	ID        int64  `json:"id"`
+	CounterID int64  `json:"counter_id"`
+	Name      string `json:"name"`
+	// URLFilter narrows the report to sessions that touched a matching page.
+	URLFilter string `json:"url_filter,omitempty"`
+	// URLMatch is how URLFilter is compared: "contains" or "regexp".
+	URLMatch string `json:"url_match,omitempty"`
+	// GoalIDs selects which goals to break down. Empty means all of them.
+	GoalIDs   []int64   `json:"goal_ids,omitempty"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Scoped reports whether the report covers less than the whole counter.
+func (r Report) Scoped() bool {
+	return strings.TrimSpace(r.URLFilter) != "" || len(r.GoalIDs) > 0
 }
 
 // Alert is a fired notification.
