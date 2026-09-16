@@ -67,14 +67,16 @@ type Report struct {
 	// GoalIDs selects which goals to break down. Empty means all of them.
 	GoalIDs []int64 `json:"goal_ids,omitempty"`
 	// GroupBy specifies grouping dimension, e.g. "url" for entrance URLs.
-	GroupBy   string    `json:"group_by,omitempty"`
+	GroupBy string `json:"group_by,omitempty"`
+	// Period is the reporting window: "today", "yesterday", "7d", "30d".
+	Period    string    `json:"period,omitempty"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // Scoped reports whether the report covers less than the whole counter.
 func (r Report) Scoped() bool {
-	return strings.TrimSpace(r.URLFilter) != "" || len(r.GoalIDs) > 0 || strings.TrimSpace(r.GroupBy) != ""
+	return strings.TrimSpace(r.URLFilter) != "" || len(r.GoalIDs) > 0 || strings.TrimSpace(r.GroupBy) != "" || (r.Period != "" && r.Period != "today")
 }
 
 // Alert is a fired notification.

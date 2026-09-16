@@ -218,7 +218,7 @@ func splitPipeFields(text string) []string {
 }
 
 func isKnownReportKeyword(field string) bool {
-	prefixes := []string{"goals=", "group=", "group_by=", "by=", "url=", "url~"}
+	prefixes := []string{"goals=", "group=", "group_by=", "by=", "url=", "url~", "period=", "период="}
 	for _, p := range prefixes {
 		if strings.HasPrefix(field, p) {
 			return true
@@ -381,19 +381,19 @@ func (b *Bot) promptAddReport(ctx context.Context, msg Message, args string) {
 	b.setPending(msg.UserID, &pendingAction{kind: actionAddReport, chatID: msg.ChatID, counterID: counterID})
 	b.reply(ctx, msg.ChatID, `Пришли описание отчёта одним сообщением:
 
-`+"`имя [| url=...] [| goals=42,77] [| group=url]`"+`
+`+"`имя [| url=...] [| goals=42,77] [| group=url] [| period=yesterday]`"+`
 
 Примеры:
 `+"`Чекаут | url=/checkout`"+`
-`+"`Заказы | goals=42,77`"+`
-`+"`Чекаут и заказы | url=/checkout | goals=42`"+`
-`+"`Каталог | url~^/catalog/`"+`
+`+"`Вчерашний чекаут | url=/checkout | period=yesterday`"+`
+`+"`Заказы за 7 дней | goals=42,77 | period=7d`"+`
 `+"`Топ страниц | group=url`"+`
 
 `+"`url=`"+` — URL содержит подстроку, `+"`url~`"+` — регулярное выражение.
 Считаются сессии, в которых была хотя бы одна такая страница.
 `+"`goals=`"+` — какие цели показывать; без него показываются все.
 `+"`group=url`"+` — сгруппировать по страницам входа (топ URL).
+`+"`period=`"+` — период: `+"`today`"+` (сегодня), `+"`yesterday`"+` (вчера), `+"`7d`"+` (7 дней), `+"`30d`"+` (30 дней).
 ID целей: /goals `+strconv.FormatInt(counterID, 10)+`
 
 Как только появится хотя бы один отчёт, сводка по всему счётчику присылаться
@@ -420,6 +420,7 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 
 	var goalIDs []int64
 	var groupBy string
+	var period string
 	for _, field := range rest {
 		field = strings.TrimSpace(field)
 		if field == "" {
@@ -460,7 +461,25 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 			groupBy = "url"
 			continue
 		}
-		b.reply(ctx, p.chatID, "Не понял часть `"+field+"`. Доступны `url=`, `url~`, `goals=` и `group=url`.")
+		if value, found := strings.CutPrefix(field, "period="); found {
+			pName, err := engine.NormalizePeriod(value)
+			if err != nil {
+				b.reply(ctx, p.chatID, "❌ "+err.Error())
+				return false
+			}
+			period = pName
+			continue
+		}
+		if value, found := strings.CutPrefix(field, "период="); found {
+			pName, err := engine.NormalizePeriod(value)
+			if err != nil {
+				b.reply(ctx, p.chatID, "❌ "+err.Error())
+				return false
+			}
+			period = pName
+			continue
+		}
+		b.reply(ctx, p.chatID, "Не понял часть `"+field+"`. Доступны `url=`, `url~`, `goals=`, `group=url` и `period=`.")
 		return false
 	}
 
@@ -471,6 +490,7 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 		URLMatch:  urlMatch,
 		GoalIDs:   goalIDs,
 		GroupBy:   groupBy,
+		Period:    period,
 		Enabled:   true,
 	}
 	if err := b.db.CreateReport(ctx, report); err != nil {
@@ -481,6 +501,9 @@ func (b *Bot) saveReport(ctx context.Context, p *pendingAction, text string) boo
 	scope := engine.URLFilterLabel(urlFilter, urlMatch)
 	if groupBy == "url" {
 		scope += ", группировка по URL"
+	}
+	if period != "" && period != "today" {
+		scope += ", период: " + engine.PeriodLabel(period)
 	}
 	b.reply(ctx, p.chatID, fmt.Sprintf(
 		"✅ Отчёт #%d *%s* создан\nОбласть: %s\n%s\n\nРасписание — /schedule",

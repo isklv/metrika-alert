@@ -453,11 +453,15 @@ func TestMigrationAddsGroupByToReports(t *testing.T) {
 	if reports[0].GroupBy != "" {
 		t.Errorf("old report has group_by: %q", reports[0].GroupBy)
 	}
+	if reports[0].Period != "" {
+		t.Errorf("old report has period: %q", reports[0].Period)
+	}
 
 	newReport := &Report{
 		CounterID: 1,
 		Name:      "Топ URL",
 		GroupBy:   "url",
+		Period:    "yesterday",
 		Enabled:   true,
 	}
 	if err := db.CreateReport(ctx, newReport); err != nil {
@@ -470,5 +474,8 @@ func TestMigrationAddsGroupByToReports(t *testing.T) {
 	}
 	if reports[1].GroupBy != "url" {
 		t.Errorf("GroupBy = %q, want 'url'", reports[1].GroupBy)
+	}
+	if reports[1].Period != "yesterday" {
+		t.Errorf("Period = %q, want 'yesterday'", reports[1].Period)
 	}
 }

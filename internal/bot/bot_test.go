@@ -960,3 +960,65 @@ func TestAddReportWithRegexAlternation(t *testing.T) {
 		t.Errorf("group_by = %q", r.GroupBy)
 	}
 }
+
+func TestAddReportWithPeriod(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Чекаут вчера | url=/checkout | period=yesterday")
+
+	say(t, b, "/addreport 1")
+	say(t, b, "За 7 дней | period=7d")
+
+	say(t, b, "/addreport 1")
+	say(t, b, "За месяц | период=30d")
+
+	reports, err := db.ListReports(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 3 {
+		t.Fatalf("got %d reports, want 3; last message: %s", len(reports), tr.last())
+	}
+
+	if reports[0].Period != "yesterday" || !reports[0].Scoped() {
+		t.Errorf("report[0] = %+v", reports[0])
+	}
+	if reports[1].Period != "7d" || !reports[1].Scoped() {
+		t.Errorf("report[1] = %+v", reports[1])
+	}
+	if reports[2].Period != "30d" || !reports[2].Scoped() {
+		t.Errorf("report[2] = %+v", reports[2])
+	}
+
+	say(t, b, "/reports 1")
+	listing := tr.last()
+	for _, want := range []string{"период: вчера", "период: 7 дней", "период: 30 дней"} {
+		if !strings.Contains(listing, want) {
+			t.Errorf("listing missing %q:\n%s", want, listing)
+		}
+	}
+}
+
+func TestAddReportRejectsInvalidPeriod(t *testing.T) {
+	b, tr, db := newTestBot(t, admin)
+	seedCounter(t, b)
+	ctx := context.Background()
+
+	say(t, b, "/addreport 1")
+	say(t, b, "Неверный период | period=year")
+
+	if !strings.Contains(tr.last(), "неизвестный период") {
+		t.Errorf("expected error message, got %q", tr.last())
+	}
+
+	reports, err := db.ListReports(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListReports: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("expected 0 reports, got %d", len(reports))
+	}
+}

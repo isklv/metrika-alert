@@ -183,6 +183,9 @@ func (b *Bot) listReports(ctx context.Context, chatID, args string) {
 			if r.GroupBy == "url" {
 				scope += ", группировка по URL"
 			}
+			if r.Period != "" && r.Period != "today" {
+				scope += ", период: " + engine.PeriodLabel(r.Period)
+			}
 			fmt.Fprintf(&sb, "• #%d %s *%s*\n    %s\n    %s\n",
 				r.ID, enabledMark(r.Enabled), r.Name,
 				scope, describeGoals(r.GoalIDs))

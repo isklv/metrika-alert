@@ -37,10 +37,88 @@ type period struct {
 	date2 string
 }
 
-var comparisons = []period{
-	{"вчера", "yesterday", "yesterday"},
-	{"неделю назад", "7daysAgo", "7daysAgo"},
-	{"месяц назад", "30daysAgo", "30daysAgo"},
+type reportWindow struct {
+	label       string // "сегодня", "вчера", "7 дней", "30 дней"
+	date1       string
+	date2       string
+	comparisons []period
+}
+
+// PeriodLabel returns human-readable Russian label for a period keyword.
+func PeriodLabel(p string) string {
+	switch p {
+	case "yesterday":
+		return "вчера"
+	case "7d":
+		return "7 дней"
+	case "30d":
+		return "30 дней"
+	default:
+		return "сегодня"
+	}
+}
+
+// NormalizePeriod validates and normalizes a report period keyword.
+func NormalizePeriod(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "today", "сегодня":
+		return "today", nil
+	case "yesterday", "вчера":
+		return "yesterday", nil
+	case "7d", "7days", "week", "неделя", "7д", "7 дней":
+		return "7d", nil
+	case "30d", "30days", "month", "месяц", "30д", "30 дней":
+		return "30d", nil
+	default:
+		return "", fmt.Errorf("неизвестный период %q: доступны today, yesterday, 7d, 30d", s)
+	}
+}
+
+func resolveReportWindow(periodName string) reportWindow {
+	switch periodName {
+	case "yesterday":
+		return reportWindow{
+			label: "вчера",
+			date1: "yesterday",
+			date2: "yesterday",
+			comparisons: []period{
+				{"позавчера", "2daysAgo", "2daysAgo"},
+				{"неделю назад", "8daysAgo", "8daysAgo"},
+				{"месяц назад", "31daysAgo", "31daysAgo"},
+			},
+		}
+	case "7d":
+		return reportWindow{
+			label: "7 дней",
+			date1: "6daysAgo",
+			date2: "today",
+			comparisons: []period{
+				{"пред. 7 дней", "13daysAgo", "7daysAgo"},
+				{"4 недели назад", "34daysAgo", "28daysAgo"},
+			},
+		}
+	case "30d":
+		return reportWindow{
+			label: "30 дней",
+			date1: "29daysAgo",
+			date2: "today",
+			comparisons: []period{
+				{"пред. 30 дней", "59daysAgo", "30daysAgo"},
+			},
+		}
+	default:
+		return reportWindow{
+			label: "сегодня",
+			date1: "today",
+			date2: "today",
+			comparisons: []period{
+				{"вчера", "yesterday", "yesterday"},
+				{"неделю назад", "7daysAgo", "7daysAgo"},
+				{"месяц назад", "30daysAgo", "30daysAgo"},
+			},
+		}
+	}
 }
 
 // RunReports sends every configured report.
@@ -149,7 +227,7 @@ func summaryFrom(res *Result) summary {
 	}
 }
 
-// ReportOne fetches today's figures for one report definition, compares them
+// ReportOne fetches figures for one report definition, compares them
 // with earlier periods and delivers the card.
 func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report *model.Report, client *ReportClient, now time.Time) error {
 	filter, err := URLFilter(report.URLFilter, report.URLMatch)
@@ -157,17 +235,19 @@ func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report
 		return err
 	}
 
+	win := resolveReportWindow(report.Period)
+
 	current, err := client.Fetch(ctx, Query{
-		Metrics: SummaryMetrics, Date1: "today", Date2: "today", Filters: filter,
+		Metrics: SummaryMetrics, Date1: win.date1, Date2: win.date2, Filters: filter,
 	})
 	if err != nil {
-		return fmt.Errorf("fetch today: %w", err)
+		return fmt.Errorf("fetch %s: %w", win.date1, err)
 	}
 
 	// Earlier periods are context, not the subject: a page with no data a month
 	// ago should still produce today's report.
-	past := make(map[string]summary, len(comparisons))
-	for _, p := range comparisons {
+	past := make(map[string]summary, len(win.comparisons))
+	for _, p := range win.comparisons {
 		res, err := client.Fetch(ctx, Query{
 			Metrics: SummaryMetrics, Date1: p.date1, Date2: p.date2, Filters: filter,
 		})
@@ -179,10 +259,10 @@ func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report
 	}
 
 	today := summaryFrom(current)
-	goals := r.goalBreakdown(ctx, counter, client, report, filter)
+	goals := r.goalBreakdown(ctx, counter, client, report, filter, win.date1, win.date2)
 	var urls []urlEntry
 	if report.GroupBy == "url" {
-		urls = r.urlBreakdown(ctx, counter, client, report, filter)
+		urls = r.urlBreakdown(ctx, counter, client, report, filter, win.date1, win.date2)
 	}
 
 	if err := r.saveSnapshot(ctx, counter.ID, now, today, goals); err != nil {
@@ -190,7 +270,7 @@ func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report
 	}
 
 	title := fmt.Sprintf("📊 %s — %s", reportTitle(counter, report), now.Format("02.01 15:04"))
-	card := r.buildCard(today, past, goals, urls, bool(current.Sampled), report)
+	card := r.buildCard(today, past, goals, urls, bool(current.Sampled), report, win)
 
 	return r.router.Alert(ctx, counter.ID, title, card)
 }
@@ -198,10 +278,14 @@ func (r *Reporter) ReportOne(ctx context.Context, counter *model.Counter, report
 // reportTitle names the report, falling back to the counter for the
 // whole-counter default.
 func reportTitle(counter *model.Counter, report *model.Report) string {
+	name := counter.Name
 	if report.Name != "" && report.Name != counter.Name {
-		return counter.Name + " · " + report.Name
+		name = counter.Name + " · " + report.Name
 	}
-	return counter.Name
+	if report.Period != "" && report.Period != "today" {
+		name += " (" + PeriodLabel(report.Period) + ")"
+	}
+	return name
 }
 
 // goalEntry is one goal's reach count for the report.
@@ -216,7 +300,7 @@ const maxGoalsInReport = 15
 
 // goalBreakdown resolves per-goal conversions. It is best effort: a token
 // without management access still yields a report, just without the breakdown.
-func (r *Reporter) goalBreakdown(ctx context.Context, counter *model.Counter, client *ReportClient, report *model.Report, filter string) []goalEntry {
+func (r *Reporter) goalBreakdown(ctx context.Context, counter *model.Counter, client *ReportClient, report *model.Report, filter string, date1, date2 string) []goalEntry {
 	goals := r.goalsToReport(ctx, counter, report)
 	if len(goals) == 0 {
 		return nil
@@ -230,7 +314,7 @@ func (r *Reporter) goalBreakdown(ctx context.Context, counter *model.Counter, cl
 		metrics = append(metrics, GoalReachesMetric(g.ID))
 	}
 
-	res, err := client.Fetch(ctx, Query{Metrics: metrics, Date1: "today", Date2: "today", Filters: filter})
+	res, err := client.Fetch(ctx, Query{Metrics: metrics, Date1: date1, Date2: date2, Filters: filter})
 	if err != nil {
 		log.Printf("report %q: fetch goal reaches: %v", report.Name, err)
 		return nil
@@ -319,7 +403,7 @@ type urlEntry struct {
 const maxURLsInReport = 10
 
 // urlBreakdown queries the Reporting API for entrance pages with visits and goal reaches.
-func (r *Reporter) urlBreakdown(ctx context.Context, counter *model.Counter, client *ReportClient, report *model.Report, filter string) []urlEntry {
+func (r *Reporter) urlBreakdown(ctx context.Context, counter *model.Counter, client *ReportClient, report *model.Report, filter string, date1, date2 string) []urlEntry {
 	metrics := []string{MetricVisits}
 	var goalIDs []int64
 	if len(report.GoalIDs) > 0 {
@@ -337,8 +421,8 @@ func (r *Reporter) urlBreakdown(ctx context.Context, counter *model.Counter, cli
 	res, err := client.Fetch(ctx, Query{
 		Metrics:    metrics,
 		Dimensions: []string{"ym:s:startURL"},
-		Date1:      "today",
-		Date2:      "today",
+		Date1:      date1,
+		Date2:      date2,
 		Filters:    filter,
 		Limit:      maxURLsInReport,
 	})
@@ -387,7 +471,7 @@ func cleanURLForDisplay(raw string) string {
 }
 
 // buildCard renders the report.
-func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goalEntry, urls []urlEntry, sampled bool, report *model.Report) string {
+func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goalEntry, urls []urlEntry, sampled bool, report *model.Report, win reportWindow) string {
 	var b strings.Builder
 
 	if scope := URLFilterLabel(report.URLFilter, report.URLMatch); report.URLFilter != "" {
@@ -395,13 +479,17 @@ func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goa
 	}
 
 	if !today.present || today.visits == 0 {
-		b.WriteString("_Сегодня данных пока нет._")
+		if win.label == "сегодня" {
+			b.WriteString("_Сегодня данных пока нет._")
+		} else {
+			b.WriteString(fmt.Sprintf("_За период «%s» данных пока нет._", win.label))
+		}
 		return b.String()
 	}
 
-	b.WriteString(metricLine("Визиты", today.visits, past, func(s summary) float64 { return s.visits }, "%.0f"))
-	b.WriteString(metricLine("Посетители", today.users, past, func(s summary) float64 { return s.users }, "%.0f"))
-	b.WriteString(metricLine("Просмотры", today.pageviews, past, func(s summary) float64 { return s.pageviews }, "%.0f"))
+	b.WriteString(metricLine("Визиты", today.visits, past, win.comparisons, func(s summary) float64 { return s.visits }, "%.0f"))
+	b.WriteString(metricLine("Посетители", today.users, past, win.comparisons, func(s summary) float64 { return s.users }, "%.0f"))
+	b.WriteString(metricLine("Просмотры", today.pageviews, past, win.comparisons, func(s summary) float64 { return s.pageviews }, "%.0f"))
 
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("*Отказы:* %.1f%%\n", today.bounceRate))
@@ -434,7 +522,7 @@ func (r *Reporter) buildCard(today summary, past map[string]summary, goals []goa
 }
 
 // metricLine renders one metric with its change against each earlier period.
-func metricLine(name string, current float64, past map[string]summary, pick func(summary) float64, format string) string {
+func metricLine(name string, current float64, past map[string]summary, comparisons []period, pick func(summary) float64, format string) string {
 	var b strings.Builder
 	b.WriteString("*" + name + ":* ")
 	b.WriteString(fmt.Sprintf(format, current))

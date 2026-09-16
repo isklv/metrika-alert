@@ -564,3 +564,123 @@ func TestReportWithURLGroupBy(t *testing.T) {
 		t.Errorf("card missing cart url line:\n%s", card.message)
 	}
 }
+
+func TestReportWithPeriodYesterday(t *testing.T) {
+	fake := &reportFake{
+		byPeriod: map[string]string{
+			"yesterday": totals(900, 700, 2700, 20, 3, 160, 35),
+			"2daysAgo":  totals(800, 600, 2400, 25, 2.8, 150, 30),
+			"8daysAgo":  totals(1000, 800, 3000, 20, 3.2, 180, 40),
+			"31daysAgo": totals(600, 500, 1800, 30, 2.5, 120, 20),
+		},
+		goals: `{"goals":[]}`,
+	}
+	reporter, router, counter := newReporterHarness(t, fake)
+
+	report := &model.Report{
+		CounterID: counter.ID,
+		Name:      "Отчёт за вчера",
+		Period:    "yesterday",
+		Enabled:   true,
+	}
+	client := NewReportClient(counter, fake.serve(t))
+	if err := reporter.ReportOne(context.Background(), counter, report, client, time.Now()); err != nil {
+		t.Fatalf("ReportOne: %v", err)
+	}
+
+	for _, want := range []string{"yesterday→yesterday", "2daysAgo→2daysAgo", "8daysAgo→8daysAgo", "31daysAgo→31daysAgo"} {
+		found := false
+		for _, got := range fake.periods() {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("period %s was never requested; asked for %v", want, fake.periods())
+		}
+	}
+
+	alert := router.last()
+	if !strings.Contains(alert.title, "(вчера)") {
+		t.Errorf("title missing period label: %q", alert.title)
+	}
+	if !strings.Contains(alert.message, "900") {
+		t.Errorf("message missing visits: %s", alert.message)
+	}
+	// 900 vs 800 (позавчера) is +12% or +13% (12.5% -> 13%)
+	if !strings.Contains(alert.message, "позавчера") {
+		t.Errorf("message missing позавчера comparison: %s", alert.message)
+	}
+}
+
+func TestReportWithPeriod7d(t *testing.T) {
+	fake := &reportFake{
+		byPeriod: map[string]string{
+			"6daysAgo":  totals(7000, 5500, 21000, 22, 3.1, 170, 250),
+			"13daysAgo": totals(6000, 4800, 18000, 24, 2.9, 160, 210),
+			"34daysAgo": totals(5000, 4000, 15000, 25, 2.7, 150, 180),
+		},
+		goals: `{"goals":[]}`,
+	}
+	reporter, router, counter := newReporterHarness(t, fake)
+
+	report := &model.Report{
+		CounterID: counter.ID,
+		Name:      "Неделя",
+		Period:    "7d",
+		Enabled:   true,
+	}
+	client := NewReportClient(counter, fake.serve(t))
+	if err := reporter.ReportOne(context.Background(), counter, report, client, time.Now()); err != nil {
+		t.Fatalf("ReportOne: %v", err)
+	}
+
+	for _, want := range []string{"6daysAgo→today", "13daysAgo→7daysAgo", "34daysAgo→28daysAgo"} {
+		found := false
+		for _, got := range fake.periods() {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("period %s was never requested; asked for %v", want, fake.periods())
+		}
+	}
+
+	alert := router.last()
+	if !strings.Contains(alert.title, "(7 дней)") {
+		t.Errorf("title missing period label: %q", alert.title)
+	}
+	if !strings.Contains(alert.message, "7000") {
+		t.Errorf("message missing visits: %s", alert.message)
+	}
+	if !strings.Contains(alert.message, "пред. 7 дней") {
+		t.Errorf("message missing previous 7 days comparison: %s", alert.message)
+	}
+}
+
+func TestReportWithPeriodNoData(t *testing.T) {
+	fake := &reportFake{
+		byPeriod: map[string]string{},
+		goals:    `{"goals":[]}`,
+	}
+	reporter, router, counter := newReporterHarness(t, fake)
+
+	report := &model.Report{
+		CounterID: counter.ID,
+		Name:      "Отчёт",
+		Period:    "yesterday",
+		Enabled:   true,
+	}
+	client := NewReportClient(counter, fake.serve(t))
+	if err := reporter.ReportOne(context.Background(), counter, report, client, time.Now()); err != nil {
+		t.Fatalf("ReportOne: %v", err)
+	}
+
+	alert := router.last()
+	if !strings.Contains(alert.message, "_За период «вчера» данных пока нет._") {
+		t.Errorf("message should state no data for yesterday, got:\n%s", alert.message)
+	}
+}

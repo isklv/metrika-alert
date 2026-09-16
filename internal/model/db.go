@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS reports (
 	-- Comma-separated goal IDs; empty means every goal of the counter.
 	goal_ids TEXT NOT NULL DEFAULT '',
 	group_by TEXT NOT NULL DEFAULT '',
+	period TEXT NOT NULL DEFAULT '',
 	enabled BOOLEAN NOT NULL DEFAULT 1,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -157,6 +158,9 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	if err := addColumnIfMissing(db, "reports", "group_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(db, "reports", "period", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return dropObsoleteTables(db)
