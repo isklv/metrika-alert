@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -137,3 +138,65 @@ func TestRedactProxyHandlesJunk(t *testing.T) {
 		t.Errorf("redactProxy leaked an unparsable value: %q", got)
 	}
 }
+
+func TestNewVKTeamsClientIgnoreTLS(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"userId":"bot@corp.example","nick":"testbot","firstName":"Bot"}`))
+	}))
+	defer srv.Close()
+
+	// Without IgnoreTLS, self-signed certificate fails
+	cfgDefault := &config.Config{
+		VKTeams: config.VKTeamsCfg{
+			BotToken: "test-token",
+			BaseURL:  srv.URL,
+		},
+	}
+	if _, err := newVKTeamsClient(cfgDefault); err == nil {
+		t.Fatal("expected TLS verification error without IgnoreTLS, got nil")
+	}
+
+	// With IgnoreTLS: true, connection succeeds
+	cfgInsecure := &config.Config{
+		VKTeams: config.VKTeamsCfg{
+			BotToken:  "test-token",
+			BaseURL:   srv.URL,
+			IgnoreTLS: true,
+		},
+	}
+	client, err := newVKTeamsClient(cfgInsecure)
+	if err != nil {
+		t.Fatalf("newVKTeamsClient failed with IgnoreTLS: true: %v", err)
+	}
+	if client == nil {
+		t.Fatal("expected non-nil client")
+	}
+}
+
+func TestApplyCLIFlags(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"-vkteams-ignore-tls"}, true},
+		{[]string{"--vkteams-ignore-tls"}, true},
+		{[]string{"-ignore-tls"}, true},
+		{[]string{"--ignore-tls"}, true},
+		{[]string{"--ignore-tls=true"}, true},
+		{[]string{"--ignore-tls=1"}, true},
+		{[]string{"--ignore-tls=false"}, false},
+		{[]string{"-vkteams-ignore-tls=false"}, false},
+		{[]string{"--other-flag"}, false},
+		{[]string{"config.yaml"}, false},
+	}
+
+	for _, tc := range tests {
+		cfg := &config.Config{}
+		applyCLIFlags(cfg, tc.args)
+		if cfg.VKTeams.IgnoreTLS != tc.want {
+			t.Errorf("applyCLIFlags(%v) IgnoreTLS = %v, want %v", tc.args, cfg.VKTeams.IgnoreTLS, tc.want)
+		}
+	}
+}
+
+

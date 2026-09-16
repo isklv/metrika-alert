@@ -41,9 +41,12 @@ NAT и не требует публичного адреса.
 ```yaml
 vkteams:
   base_url: https://myteam.corp.example/bot/v1
+  # ignore_tls: true # если корпоративный сервер использует самоподписанный сертификат
 ```
 
-или переменной `METRIKA_VKTEAMS_BASE`. Сервис проверяет токен при старте и
+или переменной `METRIKA_VKTEAMS_BASE`. Если на корпоративном сервере используется
+самоподписанный сертификат, укажите `ignore_tls: true` (или переменную
+`METRIKA_VKTEAMS_IGNORE_TLS=true`). Сервис проверяет токен при старте и
 падает с понятной ошибкой, если контур недоступен — неверный адрес вы увидите
 сразу, а не в момент первого алерта.
 
@@ -481,6 +484,7 @@ journalctl -u metrika-alert -f           # systemd
 | `METRIKA_VKTEAMS_BASE` | `vkteams.base_url` | `https://myteam.corp.example/bot/v1` |
 | `METRIKA_VKTEAMS_ADMINS` | `vkteams.admin_ids` | `admin@corp.example,ops@corp.example` |
 | `METRIKA_VKTEAMS_PROXY` | `vkteams.proxy_url` | `http://proxy:3128` |
+| `METRIKA_VKTEAMS_IGNORE_TLS` | `vkteams.ignore_tls` | `true` (для on-premise с самоподписанным TLS) |
 | `METRIKA_METRIKA_BASE` | `metrika.base_url` | `https://api-metrika.yandex.net` |
 | `METRIKA_LAG_HOURS` | `metrika.settle_minutes` | `20` |
 | `METRIKA_MAX_WINDOW_HOURS` | `metrika.max_window_hours` | `24` |

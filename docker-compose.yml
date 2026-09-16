@@ -25,6 +25,7 @@ services:
       METRIKA_VKTEAMS_ADMINS: "${METRIKA_VKTEAMS_ADMINS:-}"
       # On-premise VK Teams: point this at your own host.
       METRIKA_VKTEAMS_BASE: "${METRIKA_VKTEAMS_BASE:-https://myteam.mail.ru/bot/v1}"
+      METRIKA_VKTEAMS_IGNORE_TLS: "${METRIKA_VKTEAMS_IGNORE_TLS:-}"
       METRIKA_VKTEAMS_PROXY: "${METRIKA_VKTEAMS_PROXY:-}"
       # --- REST API (off by default) ---
       METRIKA_API_ENABLED: "${METRIKA_API_ENABLED:-false}"

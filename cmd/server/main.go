@@ -51,6 +51,8 @@ func main() {
 	}
 	log.Printf("config loaded from %s", cfgPath)
 
+	applyCLIFlags(cfg, os.Args[1:])
+
 	db, err := openDB(cfg)
 	if err != nil {
 		log.Fatalf("db: %v", err)
@@ -219,8 +221,13 @@ func newVKTeamsClient(cfg *config.Config) (*vkteams.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.VKTeams.IgnoreTLS {
+		log.Printf("vkteams: проверка сертификатов TLS отключена (ignore_tls)")
+	}
 	client, err := vkteams.New(cfg.VKTeams.BotToken, vkteams.Options{
 		BaseURL:   cfg.VKTeams.BaseURL,
+		ProxyURL:  cfg.VKTeams.ProxyURL,
+		IgnoreTLS: cfg.VKTeams.IgnoreTLS,
 		Transport: transport,
 	})
 	if err != nil {
@@ -358,6 +365,21 @@ func runHealthCheck() int {
 		return 1
 	}
 	return 0
+}
+
+// applyCLIFlags overrides configuration with command-line flags.
+func applyCLIFlags(cfg *config.Config, args []string) {
+	for _, arg := range args {
+		switch {
+		case arg == "-vkteams-ignore-tls" || arg == "--vkteams-ignore-tls" || arg == "-ignore-tls" || arg == "--ignore-tls":
+			cfg.VKTeams.IgnoreTLS = true
+		case strings.HasPrefix(arg, "-vkteams-ignore-tls=") || strings.HasPrefix(arg, "--vkteams-ignore-tls=") ||
+			strings.HasPrefix(arg, "-ignore-tls=") || strings.HasPrefix(arg, "--ignore-tls="):
+			parts := strings.SplitN(arg, "=", 2)
+			v := strings.ToLower(strings.TrimSpace(parts[1]))
+			cfg.VKTeams.IgnoreTLS = v == "true" || v == "1" || v == "yes"
+		}
+	}
 }
 
 // findConfig locates the config file: an explicit path argument first, then

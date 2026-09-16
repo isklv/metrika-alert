@@ -141,3 +141,57 @@ func TestNewKeepsOnPremiseEndpoint(t *testing.T) {
 		t.Errorf("BaseURL = %q, want %q (trailing slash trimmed)", c.BaseURL(), onPrem)
 	}
 }
+
+func TestIgnoreTLSSelfSignedServer(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"userId":"bot@corp.example","nick":"testbot","firstName":"Bot"}`))
+	}))
+	defer srv.Close()
+
+	// Default client should fail TLS verification on self-signed cert.
+	cDefault, err := New("test-token", Options{BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := cDefault.GetSelf(context.Background()); err == nil {
+		t.Fatal("expected TLS verification error without IgnoreTLS, got nil")
+	}
+
+	// With IgnoreTLS: true, request should succeed.
+	cInsecure, err := New("test-token", Options{BaseURL: srv.URL, IgnoreTLS: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	self, err := cInsecure.GetSelf(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelf failed with IgnoreTLS: true: %v", err)
+	}
+	if self.Nick != "testbot" {
+		t.Errorf("Nick = %q, want testbot", self.Nick)
+	}
+}
+
+func TestIgnoreTLSWithCustomTransport(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true,"userId":"bot@corp.example","nick":"testbot","firstName":"Bot"}`))
+	}))
+	defer srv.Close()
+
+	baseTr := &http.Transport{}
+	cInsecure, err := New("test-token", Options{
+		BaseURL:   srv.URL,
+		IgnoreTLS: true,
+		Transport: baseTr,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	self, err := cInsecure.GetSelf(context.Background())
+	if err != nil {
+		t.Fatalf("GetSelf failed with IgnoreTLS: true and custom transport: %v", err)
+	}
+	if self.Nick != "testbot" {
+		t.Errorf("Nick = %q, want testbot", self.Nick)
+	}
+}
+

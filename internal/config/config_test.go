@@ -54,7 +54,41 @@ vkteams:
 	if len(cfg.VKTeams.AdminIDs) != 2 || cfg.VKTeams.AdminIDs[0] != "admin@corp.example" {
 		t.Errorf("admin_ids = %v", cfg.VKTeams.AdminIDs)
 	}
+	if cfg.VKTeams.IgnoreTLS {
+		t.Errorf("ignore_tls = true, want default false")
+	}
 }
+
+func TestLoadVKTeamsIgnoreTLS(t *testing.T) {
+	for _, body := range []string{
+		"vkteams:\n  bot_token: tok\n  ignore_tls: true\n",
+		"vkteams:\n  bot_token: tok\n  insecure_tls: true\n",
+	} {
+		cfg, err := Load(writeConfig(t, body))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.VKTeams.IgnoreTLS {
+			t.Errorf("expected IgnoreTLS to be true for config:\n%s", body)
+		}
+	}
+}
+
+func TestEnvVKTeamsIgnoreTLS(t *testing.T) {
+	for _, envKey := range []string{"METRIKA_VKTEAMS_IGNORE_TLS", "METRIKA_VKTEAMS_INSECURE_TLS"} {
+		t.Run(envKey, func(t *testing.T) {
+			t.Setenv(envKey, "true")
+			cfg, err := Load(writeConfig(t, "vkteams:\n  bot_token: tok\n  ignore_tls: false\n"))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !cfg.VKTeams.IgnoreTLS {
+				t.Errorf("%s=true did not enable IgnoreTLS", envKey)
+			}
+		})
+	}
+}
+
 
 func TestEnvOverridesWin(t *testing.T) {
 	t.Setenv("METRIKA_VKTEAMS_TOKEN", "from-env")

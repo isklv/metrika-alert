@@ -24,6 +24,7 @@ vkteams:
   admin_ids:
     - user@corp.example
   # proxy_url: http://proxy.corp.example:3128
+  # ignore_tls: true # skip TLS certificate verification for on-premise servers with self-signed certs
 
 # --- Yandex.Metrika -----------------------------------------------------------
 # OAuth tokens are stored per counter in the database, not here.

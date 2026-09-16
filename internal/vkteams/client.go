@@ -9,6 +9,7 @@ package vkteams
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ type Client struct {
 type Options struct {
 	BaseURL   string
 	ProxyURL  string
+	IgnoreTLS bool
 	Transport http.RoundTripper // overrides ProxyURL; used by tests
 }
 
@@ -51,12 +53,32 @@ func New(token string, opts Options) (*Client, error) {
 	}
 
 	transport := opts.Transport
-	if transport == nil && opts.ProxyURL != "" {
-		proxy, err := url.Parse(opts.ProxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("vkteams: bad proxy_url %q: %w", opts.ProxyURL, err)
+	if transport == nil {
+		if opts.ProxyURL != "" || opts.IgnoreTLS {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			if opts.ProxyURL != "" {
+				proxy, err := url.Parse(opts.ProxyURL)
+				if err != nil {
+					return nil, fmt.Errorf("vkteams: bad proxy_url %q: %w", opts.ProxyURL, err)
+				}
+				tr.Proxy = http.ProxyURL(proxy)
+			}
+			if opts.IgnoreTLS {
+				tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+			}
+			transport = tr
 		}
-		transport = &http.Transport{Proxy: http.ProxyURL(proxy)}
+	} else if opts.IgnoreTLS {
+		if tr, ok := transport.(*http.Transport); ok {
+			cloned := tr.Clone()
+			if cloned.TLSClientConfig == nil {
+				cloned.TLSClientConfig = &tls.Config{}
+			} else {
+				cloned.TLSClientConfig = cloned.TLSClientConfig.Clone()
+			}
+			cloned.TLSClientConfig.InsecureSkipVerify = true
+			transport = cloned
+		}
 	}
 
 	return &Client{

@@ -29,10 +29,12 @@ type TelegramCfg struct {
 
 // VKTeamsCfg configures the VK Teams (Mail.ru Myteam) bot.
 type VKTeamsCfg struct {
-	BotToken string   `yaml:"bot_token"`
-	BaseURL  string   `yaml:"base_url"`  // bot API endpoint, cloud by default
-	AdminIDs []string `yaml:"admin_ids"` // VK Teams user IDs (email- or numeric-like strings)
-	ProxyURL string   `yaml:"proxy_url"`
+	BotToken    string   `yaml:"bot_token"`
+	BaseURL     string   `yaml:"base_url"`  // bot API endpoint, cloud by default
+	AdminIDs    []string `yaml:"admin_ids"` // VK Teams user IDs (email- or numeric-like strings)
+	ProxyURL    string   `yaml:"proxy_url"`
+	IgnoreTLS   bool     `yaml:"ignore_tls"`
+	InsecureTLS bool     `yaml:"insecure_tls,omitempty"`
 }
 
 type MetrikaCfg struct {
@@ -95,6 +97,7 @@ const DefaultVKTeamsURL = "https://myteam.mail.ru/bot/v1"
 //	METRIKA_VKTEAMS_BASE    — VK Teams bot API base URL
 //	METRIKA_VKTEAMS_ADMINS  — comma-separated VK Teams admin user IDs
 //	METRIKA_VKTEAMS_PROXY   — proxy URL for VK Teams
+//	METRIKA_VKTEAMS_IGNORE_TLS — "true" to ignore TLS certificate errors
 //	METRIKA_METRIKA_BASE    — metrika API base URL
 //	METRIKA_SETTLE_MINUTES  — delay before a closed hour is judged
 //	METRIKA_WINDOW_MINUTES  — width of one measurement window
@@ -146,6 +149,9 @@ func applyDefaults(c *Config) {
 	if c.VKTeams.BaseURL == "" {
 		c.VKTeams.BaseURL = DefaultVKTeamsURL
 	}
+	if c.VKTeams.InsecureTLS {
+		c.VKTeams.IgnoreTLS = true
+	}
 	if c.Database == "" {
 		c.Database = "metrika.db"
 	}
@@ -190,6 +196,11 @@ func applyEnvOverrides(c *Config) {
 	}
 	if v := os.Getenv("METRIKA_VKTEAMS_PROXY"); v != "" {
 		c.VKTeams.ProxyURL = v
+	}
+	if v := os.Getenv("METRIKA_VKTEAMS_IGNORE_TLS"); v != "" {
+		c.VKTeams.IgnoreTLS = v == "true" || v == "1" || v == "yes"
+	} else if v := os.Getenv("METRIKA_VKTEAMS_INSECURE_TLS"); v != "" {
+		c.VKTeams.IgnoreTLS = v == "true" || v == "1" || v == "yes"
 	}
 	if v := os.Getenv("METRIKA_METRIKA_BASE"); v != "" {
 		c.Metrika.BaseURL = v
