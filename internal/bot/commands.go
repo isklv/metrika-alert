@@ -2,13 +2,14 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
-
 	"time"
 
 	"github.com/isklv/metrika-alert/internal/engine"
+	"github.com/isklv/metrika-alert/internal/model"
 )
 
 func (b *Bot) sendMenu(ctx context.Context, chatID string) {
@@ -34,6 +35,10 @@ func (b *Bot) sendMenu(ctx context.Context, chatID string) {
 /report [counter_id] — запустить отчёты сейчас
 /schedule [расписание] — когда присылать отчёты
 /poll — опросить все счётчики один раз
+
+/export [id|safe|text] — экспорт настроек (JSON)
+/import [replace] — импорт настроек
+
 /whoami — показать свой ID
 /version — версия запущенной сборки
 /help — это меню`)
@@ -468,3 +473,108 @@ func enabledMark(enabled bool) string {
 	}
 	return "⛔"
 }
+
+// ---- Export ----
+
+func (b *Bot) exportSettings(ctx context.Context, chatID, args string) {
+	counterID, includeTokens, forceText, err := parseExportArgs(args)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ "+err.Error())
+		return
+	}
+
+	if counterID > 0 {
+		if _, err := b.db.GetCounter(ctx, counterID); err != nil {
+			b.reply(ctx, chatID, "❌ Счётчик не найден. Список: /counters")
+			return
+		}
+	}
+
+	data, err := b.db.Export(ctx, counterID, includeTokens)
+	if err != nil {
+		b.replyErr(ctx, chatID, err)
+		return
+	}
+
+	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		b.replyErr(ctx, chatID, err)
+		return
+	}
+
+	filename := "metrika-alert-settings.json"
+	if counterID > 0 && len(data.Counters) > 0 {
+		filename = fmt.Sprintf("metrika-alert-%s.json", data.Counters[0].CounterID)
+	}
+
+	summary := formatExportSummary(data, includeTokens)
+
+	if !forceText {
+		if dt, ok := b.transport.(DocumentTransport); ok {
+			caption := summary + "\n\nИмпорт: пришли этот файл с подписью `/import`"
+			if err := dt.SendDocument(ctx, chatID, filename, jsonBytes, caption); err == nil {
+				return
+			}
+		}
+	}
+
+	if len(jsonBytes) < 3500 {
+		b.reply(ctx, chatID, fmt.Sprintf("%s\n\n```json\n%s\n```", summary, string(jsonBytes)))
+	} else {
+		b.reply(ctx, chatID, summary+"\n\n_Настройки (JSON):_")
+		b.reply(ctx, chatID, string(jsonBytes))
+	}
+}
+
+func parseExportArgs(args string) (counterID int64, includeTokens bool, forceText bool, err error) {
+	includeTokens = true
+	fields := strings.Fields(args)
+	for _, f := range fields {
+		fl := strings.ToLower(f)
+		switch fl {
+		case "safe", "notoken", "notokens", "no-token", "no-tokens":
+			includeTokens = false
+		case "text", "txt":
+			forceText = true
+		default:
+			id, parseErr := strconv.ParseInt(f, 10, 64)
+			if parseErr != nil || id <= 0 {
+				return 0, false, false, fmt.Errorf("неизвестный аргумент %q. Доступны: ID счётчика, `safe` (без токенов), `text` (в чат)", f)
+			}
+			if counterID > 0 {
+				return 0, false, false, fmt.Errorf("ID счётчика указан дважды: %d и %d", counterID, id)
+			}
+			counterID = id
+		}
+	}
+	return counterID, includeTokens, forceText, nil
+}
+
+func formatExportSummary(data *model.ExportData, includeTokens bool) string {
+	var sb strings.Builder
+	sb.WriteString("*Экспорт настроек:*\n\n")
+
+	triggerCount := 0
+	reportCount := 0
+	for _, c := range data.Counters {
+		triggerCount += len(c.Triggers)
+		reportCount += len(c.Reports)
+	}
+
+	fmt.Fprintf(&sb, "• Счётчики: %d\n", len(data.Counters))
+	fmt.Fprintf(&sb, "• Триггеры: %d\n", triggerCount)
+	if reportCount > 0 {
+		fmt.Fprintf(&sb, "• Отчёты: %d\n", reportCount)
+	}
+	if len(data.AlertActions) > 0 {
+		fmt.Fprintf(&sb, "• Destinations: %d\n", len(data.AlertActions))
+	}
+	if data.Schedule != "" {
+		fmt.Fprintf(&sb, "• Расписание: %s\n", data.Schedule)
+	}
+	if !includeTokens {
+		sb.WriteString("• _OAuth-токены исключены (safe)_\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+

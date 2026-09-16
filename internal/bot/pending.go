@@ -25,13 +25,15 @@ const (
 	actionAddTrigger = "addtrigger"
 	actionAddAction  = "addaction"
 	actionAddReport  = "addreport"
+	actionImport     = "import"
 )
 
 type pendingAction struct {
-	kind   string
-	chatID string
+	kind      string
+	chatID    string
 	// counterID is the counter the flow is scoped to, for monitors and triggers.
 	counterID int64
+	replace   bool
 }
 
 func (b *Bot) setPending(userID string, p *pendingAction) {
@@ -65,6 +67,8 @@ func (b *Bot) handlePending(ctx context.Context, userID, text string) bool {
 		done = b.saveAlertAction(ctx, p, text)
 	case actionAddReport:
 		done = b.saveReport(ctx, p, text)
+	case actionImport:
+		done = b.saveImport(ctx, p, text)
 	default:
 		b.clearPending(userID)
 		return false
@@ -589,3 +593,104 @@ func (b *Bot) saveAlertAction(ctx context.Context, p *pendingAction, text string
 		action.ID, action.Type, action.Destination()))
 	return true
 }
+
+// ---- import ----
+
+func (b *Bot) promptOrRunImport(ctx context.Context, msg Message, args string) {
+	replace := false
+	argsLower := strings.ToLower(args)
+	if strings.Contains(argsLower, "replace") || strings.Contains(argsLower, "overwrite") {
+		replace = true
+		args = strings.TrimSpace(strings.Replace(strings.Replace(args, "replace", "", -1), "overwrite", "", -1))
+	}
+
+	var jsonInput string
+	if len(msg.Data) > 0 {
+		jsonInput = string(msg.Data)
+	} else if strings.HasPrefix(strings.TrimSpace(args), "{") || strings.HasPrefix(strings.TrimSpace(args), "version:") || strings.HasPrefix(strings.TrimSpace(args), "```") {
+		jsonInput = strings.TrimSpace(args)
+	}
+
+	if jsonInput != "" {
+		b.runImport(ctx, msg.ChatID, jsonInput, replace)
+		return
+	}
+
+	b.setPending(msg.UserID, &pendingAction{kind: actionImport, chatID: msg.ChatID, replace: replace})
+
+	modeMsg := "По умолчанию новые счётчики и правила добавляются, а существующие обновляются (merge).\nДля полной замены используй: `/import replace`"
+	if replace {
+		modeMsg = "⚠️ *Внимание: включён режим полной замены (replace)*.\nВсе текущие счётчики, правила и destinations будут перезаписаны настройками из файла."
+	}
+
+	b.reply(ctx, msg.ChatID, fmt.Sprintf(
+		"Пришли файл настроек (.json) или вставь JSON прямо в ответном сообщении.\n\n%s\n\nОтменить: /help",
+		modeMsg))
+}
+
+func (b *Bot) saveImport(ctx context.Context, p *pendingAction, text string) bool {
+	return b.runImport(ctx, p.chatID, text, p.replace)
+}
+
+func (b *Bot) runImport(ctx context.Context, chatID, text string, replace bool) bool {
+	data, err := model.UnmarshalExportData([]byte(text))
+	if err != nil {
+		b.reply(ctx, chatID, "❌ Ошибка разбора данных: "+err.Error())
+		return false
+	}
+
+	result, err := b.db.Import(ctx, data, replace, b)
+	if err != nil {
+		b.reply(ctx, chatID, "❌ Ошибка импорта: "+err.Error())
+		return false
+	}
+
+	if result.ScheduleUpdated && b.scheduler != nil {
+		if sched, err := engine.ParseSchedule(result.Schedule); err == nil {
+			_ = b.scheduler.SetSchedule(ctx, sched)
+		}
+	}
+
+	modeName := "слияние / merge"
+	if replace {
+		modeName = "полная замена / replace"
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "✅ *Импорт настроек завершён* (режим: %s)\n\n", modeName)
+	if replace {
+		fmt.Fprintf(&sb, "• Счётчики: %d\n", result.CountersCreated)
+		fmt.Fprintf(&sb, "• Триггеры: %d\n", result.TriggersCreated)
+		if result.ReportsCreated > 0 {
+			fmt.Fprintf(&sb, "• Отчёты: %d\n", result.ReportsCreated)
+		}
+		if result.ActionsCreated > 0 {
+			fmt.Fprintf(&sb, "• Destinations: %d\n", result.ActionsCreated)
+		}
+	} else {
+		fmt.Fprintf(&sb, "• Счётчики: добавлено %d, обновлено %d\n", result.CountersCreated, result.CountersUpdated)
+		fmt.Fprintf(&sb, "• Триггеры: добавлено %d, обновлено %d\n", result.TriggersCreated, result.TriggersUpdated)
+		if result.ReportsCreated > 0 || result.ReportsUpdated > 0 {
+			fmt.Fprintf(&sb, "• Отчёты: добавлено %d, обновлено %d\n", result.ReportsCreated, result.ReportsUpdated)
+		}
+		if result.ActionsCreated > 0 || result.ActionsUpdated > 0 {
+			fmt.Fprintf(&sb, "• Destinations: добавлено %d, обновлено %d\n", result.ActionsCreated, result.ActionsUpdated)
+		}
+	}
+
+	if result.ScheduleUpdated {
+		fmt.Fprintf(&sb, "• Расписание отчётов: %s\n", result.Schedule)
+	}
+
+	if len(result.Warnings) > 0 {
+		sb.WriteString("\n⚠️ *Предупреждения:*\n")
+		for _, w := range result.Warnings {
+			fmt.Fprintf(&sb, "• %s\n", w)
+		}
+	}
+
+	sb.WriteString("\nПрименится в течение минуты, перезапуск не нужен.")
+	b.reply(ctx, chatID, sb.String())
+	return true
+}
+

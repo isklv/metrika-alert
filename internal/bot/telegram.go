@@ -2,8 +2,12 @@ package bot
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"strconv"
+	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -47,6 +51,60 @@ func (t *TelegramTransport) Send(_ context.Context, chatID, text string) error {
 	return err
 }
 
+// SendDocument delivers a file with an optional caption.
+func (t *TelegramTransport) SendDocument(_ context.Context, chatID, filename string, content []byte, caption string) error {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return err
+	}
+
+	doc := tgbotapi.NewDocument(id, tgbotapi.FileBytes{
+		Name:  filename,
+		Bytes: content,
+	})
+	if caption != "" {
+		doc.Caption = caption
+		doc.ParseMode = tgbotapi.ModeMarkdown
+	}
+
+	if _, err := t.api.Send(doc); err == nil {
+		return nil
+	}
+
+	if caption != "" {
+		doc.Caption = stripMarkdown(caption)
+		doc.ParseMode = ""
+		if _, err := t.api.Send(doc); err == nil {
+			return nil
+		}
+	}
+
+	doc.Caption = ""
+	doc.ParseMode = ""
+	_, err = t.api.Send(doc)
+	return err
+}
+
+func downloadTelegramDocument(ctx context.Context, api *tgbotapi.BotAPI, fileID string) ([]byte, error) {
+	fileURL, err := api.GetFileDirectURL(fileID)
+	if err != nil {
+		return nil, fmt.Errorf("get file url: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create download request: %w", err)
+	}
+	resp, err := api.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download file: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download file status %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+}
+
 // RunTelegram pumps Telegram updates into the bot until ctx is cancelled.
 func RunTelegram(ctx context.Context, api *tgbotapi.BotAPI, b *Bot) {
 	u := tgbotapi.NewUpdate(0)
@@ -63,13 +121,36 @@ func RunTelegram(ctx context.Context, api *tgbotapi.BotAPI, b *Bot) {
 
 	for update := range updates {
 		msg := update.Message
-		if msg == nil || msg.From == nil || msg.Text == "" {
+		if msg == nil || msg.From == nil {
 			continue
 		}
+
+		var fileData []byte
+		if msg.Document != nil && msg.Document.FileSize <= 10<<20 {
+			data, err := downloadTelegramDocument(ctx, api, msg.Document.FileID)
+			if err != nil {
+				log.Printf("telegram: download document %s: %v", msg.Document.FileName, err)
+			} else {
+				fileData = data
+			}
+		}
+
+		text := strings.TrimSpace(msg.Text)
+		if text == "" {
+			text = strings.TrimSpace(msg.Caption)
+		}
+		if text == "" && len(fileData) > 0 {
+			text = string(fileData)
+		}
+		if text == "" && len(fileData) == 0 {
+			continue
+		}
+
 		b.Handle(ctx, Message{
 			UserID: strconv.FormatInt(msg.From.ID, 10),
 			ChatID: strconv.FormatInt(msg.Chat.ID, 10),
-			Text:   msg.Text,
+			Text:   text,
+			Data:   fileData,
 		})
 	}
 }

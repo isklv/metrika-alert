@@ -36,11 +36,18 @@ type Transport interface {
 	Measure(text string) int
 }
 
+// DocumentTransport is an optional Transport capability to deliver files as documents.
+type DocumentTransport interface {
+	Transport
+	SendDocument(ctx context.Context, chatID, filename string, content []byte, caption string) error
+}
+
 // Message is one inbound chat message, normalised across transports.
 type Message struct {
 	UserID string
 	ChatID string
 	Text   string
+	Data   []byte // optional attachment content (e.g. uploaded file)
 }
 
 // MetrikaLookup answers questions about a counter's configuration in Metrika.
@@ -128,7 +135,24 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		// message, and replying to all of them would make it unusable there.
 		// Prompts are only ever opened for admins, so this path needs no further
 		// authorisation check.
-		return b.handlePending(ctx, msg.UserID, text)
+		inputText := text
+		if len(msg.Data) > 0 {
+			inputText = string(msg.Data)
+		}
+		handled := b.handlePending(ctx, msg.UserID, inputText)
+		if !handled && len(msg.Data) > 0 {
+			if !b.IsAdmin(msg.UserID) {
+				b.reply(ctx, msg.ChatID, fmt.Sprintf(
+					"⛔ Доступ запрещён.\n\nТвой ID: `%s`\nДобавь его в config.yaml → `%s.admin_ids` и перезапусти сервис.",
+					msg.UserID, b.transport.Name()))
+				return true
+			}
+			b.reply(ctx, msg.ChatID, "📄 Получен файл. Чтобы импортировать его:\n"+
+				"• Отправь команду /import и затем пришли файл\n"+
+				"• Или пришли файл с подписью `/import` (добавить/обновить) или `/import replace` (заменить всё)")
+			return true
+		}
+		return handled
 	}
 
 	if !b.IsAdmin(msg.UserID) {
@@ -179,6 +203,10 @@ func (b *Bot) Handle(ctx context.Context, msg Message) bool {
 		b.deleteReport(ctx, msg.ChatID, args)
 	case "poll":
 		b.runPollOnce(ctx, msg.ChatID)
+	case "export":
+		b.exportSettings(ctx, msg.ChatID, args)
+	case "import":
+		b.promptOrRunImport(ctx, msg, args)
 	case "version":
 		b.showVersion(ctx, msg.ChatID)
 	case "whoami":
@@ -243,3 +271,28 @@ func (b *Bot) reply(ctx context.Context, chatID, text string) {
 func stripMarkdown(s string) string {
 	return strings.NewReplacer("*", "", "`", "").Replace(s)
 }
+
+// ValidateMetric checks if a metric name is recognized by the engine.
+func (b *Bot) ValidateMetric(metric string) error {
+	_, err := engine.ResolveMetric(metric)
+	return err
+}
+
+// ValidateSchedule checks if a schedule string is valid.
+func (b *Bot) ValidateSchedule(schedule string) error {
+	if schedule == "" || schedule == "off" {
+		return nil
+	}
+	_, err := engine.ParseSchedule(schedule)
+	return err
+}
+
+// ValidatePeriod checks if a report period is valid.
+func (b *Bot) ValidatePeriod(period string) error {
+	if period == "" {
+		return nil
+	}
+	_, err := engine.NormalizePeriod(period)
+	return err
+}
+
